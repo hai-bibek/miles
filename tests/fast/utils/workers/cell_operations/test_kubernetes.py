@@ -8,7 +8,11 @@ import pytest
 
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations import kubernetes as cell_operations_kubernetes
-from miles.utils.workers.cell_operations.base import CellTerminationNotConfirmedError, CellTerminationOutcome
+from miles.utils.workers.cell_operations.base import (
+    CellTerminationNotConfirmedError,
+    CellTerminationOutcome,
+    FaultInjectionOutcome,
+)
 from miles.utils.workers.cell_operations.kubernetes import KubernetesCellOperations
 from miles.utils.workers.worker_handle import WorkerUnreachableError
 from miles.utils.workers.worker_info import WorkerInfo
@@ -91,6 +95,12 @@ class FakeProvider:
 
     def cell_info(self, cell_id: str) -> CellInfo | None:
         return self._infos.get(cell_id)
+
+    def cell_incarnation(self, cell_id: str) -> CellIncarnation | None:
+        info = self._infos.get(cell_id)
+        if info is None:
+            return None
+        return CellIncarnation(cell_id=cell_id, workers_hash=info.workers_hash, pods=[])
 
     def pod_names_of_cell(self, cell_id: str) -> list[str]:
         info = self._infos.get(cell_id)
@@ -943,3 +953,169 @@ def _parsed_pod(*, deleting: bool) -> ParsedPod:
         subdomain=None,
         gpu_ids=(),
     )
+
+
+class TestInferenceCellFaults:
+    async def test_a_replaced_cell_is_not_executed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An old weight update cannot inject into a replacement cell."""
+        provider = IncarnationProvider(pods=[make_pod("p0")], workers_hash="new")
+        operations = KubernetesCellOperations(provider=provider, namespace="test")
+        outcome = await operations.inject_fault(
+            cell_id="engine-0", sub_index=0, mode=FailureMode.SIGKILL, expected_workers_hash="old"
+        )
+        assert outcome is FaultInjectionOutcome.STALE
+
+    @pytest.mark.parametrize("mode", [FailureMode.SIGKILL])
+    async def test_the_target_pod_and_signal_reach_exec(
+        self, monkeypatch: pytest.MonkeyPatch, mode: FailureMode
+    ) -> None:
+        """Both signal modes use the pod of the selected worker and retain its identity."""
+        pod = make_pod("p1")
+        provider = IncarnationProvider(pods=[make_pod("p0"), pod])
+        provider.pod_name_of_worker = lambda *, cell_id, sub_index: provider.pods[sub_index].name
+        calls = []
+
+        async def execute(**kwargs):
+            calls.append(kwargs)
+            return FaultInjectionOutcome.INJECTED
+
+        monkeypatch.setattr(cell_operations_kubernetes, "_inject_fault_in_pod", execute)
+        operations = KubernetesCellOperations(provider=provider, namespace="test")
+        result = await operations.inject_fault(
+            cell_id="engine-0", sub_index=1, mode=mode, expected_workers_hash="hash-1"
+        )
+        assert result is FaultInjectionOutcome.INJECTED
+        assert calls == [{"namespace": "test", "pod": pod, "mode": mode}]
+
+    @pytest.mark.parametrize("error", [TimeoutError("no answer"), ConnectionError("disconnected")])
+    async def test_a_missing_answer_does_not_claim_delivery(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        """A missing exec answer leaves fault delivery unknown."""
+        provider = IncarnationProvider(pods=[make_pod("p0")])
+        provider.pod_name_of_worker = lambda **kwargs: "p0"
+
+        async def execute(**kwargs):
+            raise error
+
+        monkeypatch.setattr(cell_operations_kubernetes, "_inject_fault_in_pod", execute)
+        operations = KubernetesCellOperations(provider=provider, namespace="test")
+        assert (
+            await operations.inject_fault(
+                cell_id="engine-0", sub_index=0, mode=FailureMode.SIGKILL, expected_workers_hash="hash-1"
+            )
+            is FaultInjectionOutcome.UNKNOWN
+        )
+
+
+class TestPodExecStatus:
+    @pytest.mark.parametrize(
+        "status", [b'{"status":"Success"}', b'{"status":"Failure","details":{"causes":[{"message":"1"}]}}']
+    )
+    async def test_only_zero_exit_status_confirms_injection(self, status: bytes) -> None:
+        """A successful HTTP connection cannot conceal a failed pod command."""
+        from types import SimpleNamespace
+
+        from aiohttp import WSMsgType
+
+        async def messages():
+            yield SimpleNamespace(type=WSMsgType.BINARY, data=b"\x01output")
+            yield SimpleNamespace(type=WSMsgType.BINARY, data=b"\x03" + status)
+
+        if b"Success" in status:
+            assert await cell_operations_kubernetes._read_exec_outcome(messages()) is FaultInjectionOutcome.INJECTED
+        else:
+            with pytest.raises(RuntimeError, match="exited with code 1"):
+                await cell_operations_kubernetes._read_exec_outcome(messages())
+
+    async def test_output_without_exit_status_is_unknown(self) -> None:
+        """A disconnected exec stream cannot establish that the signal was sent."""
+        from types import SimpleNamespace
+
+        from aiohttp import WSMsgType
+
+        async def messages():
+            yield SimpleNamespace(type=WSMsgType.BINARY, data=b"\x01output")
+
+        assert await cell_operations_kubernetes._read_exec_outcome(messages()) is FaultInjectionOutcome.UNKNOWN
+
+
+class TestPodFaultCommand:
+    @pytest.mark.parametrize("replacement", [None, "pod", "container"])
+    async def test_exec_requires_the_observed_pod_and_container(
+        self, monkeypatch: pytest.MonkeyPatch, replacement: str | None
+    ) -> None:
+        """Replacing either the pod or its container prevents the exec request."""
+        from types import SimpleNamespace
+        from aiohttp import WSMsgType
+        from kubernetes_asyncio import client, stream
+
+        pod = make_pod("p0")
+        calls = []
+        observed = SimpleNamespace(
+            metadata=SimpleNamespace(uid="replacement" if replacement == "pod" else pod.uid),
+            spec=SimpleNamespace(host_pid=False),
+            status=SimpleNamespace(
+                container_statuses=[
+                    SimpleNamespace(
+                        name="worker",
+                        container_id="replacement" if replacement == "container" else pod.containers[0].container_id,
+                    )
+                ]
+            ),
+        )
+
+        class PodApi:
+            async def read_namespaced_pod(self, **kwargs):
+                return observed
+
+        @asynccontextmanager
+        async def api():
+            yield PodApi()
+
+        async def messages():
+            yield SimpleNamespace(type=WSMsgType.BINARY, data=b'\x03{"status":"Success"}')
+
+        @asynccontextmanager
+        async def connection():
+            yield messages()
+
+        class ExecApi:
+            async def connect_get_namespaced_pod_exec(self, **kwargs):
+                calls.append(kwargs)
+                return connection()
+
+        class WsClient:
+            parse_error_data = staticmethod(stream.WsApiClient.parse_error_data)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        monkeypatch.setattr(cell_operations_kubernetes, "_core_v1_api", api)
+        monkeypatch.setattr(client, "CoreV1Api", lambda **kwargs: ExecApi())
+        monkeypatch.setattr(stream, "WsApiClient", WsClient)
+
+        outcome = await cell_operations_kubernetes._inject_fault_in_pod(
+            namespace="test", pod=pod, mode=FailureMode.SIGKILL
+        )
+        if replacement is not None:
+            assert outcome is FaultInjectionOutcome.STALE
+            assert calls == []
+        else:
+            assert outcome is FaultInjectionOutcome.INJECTED
+            assert calls == [
+                dict(
+                    name="p0",
+                    namespace="test",
+                    container="worker",
+                    command=["sh", "-c", "pkill -KILL -f '[s]glang::'"],
+                    stdin=False,
+                    stdout=True,
+                    stderr=True,
+                    tty=False,
+                    _preload_content=False,
+                )
+            ]

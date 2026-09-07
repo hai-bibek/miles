@@ -8,8 +8,13 @@ from typing import Any
 import pytest
 
 from miles.utils.test_utils.fault_injector import FailureMode
-from miles.utils.workers.cell_operations.base import CellTerminationNotConfirmedError, CellTerminationOutcome
+from miles.utils.workers.cell_operations.base import (
+    CellTerminationNotConfirmedError,
+    CellTerminationOutcome,
+    FaultInjectionOutcome,
+)
 from miles.utils.workers.cell_operations.ray import RayCellOperations
+
 
 _TRAINER_CELL_ID = "trainer-engine-actor-00001"
 
@@ -35,6 +40,9 @@ class _RecordingWorkerManagerHandle:
         self.start_cells = _RecordingRemoteMethod(name="start_cells", calls=self.calls)
         self.stop_cells = _RecordingRemoteMethod(name="stop_cells", calls=self.calls)
         self.inject_fault = _RecordingRemoteMethod(name="inject_fault", calls=self.calls)
+        self.inject_fault.result = FaultInjectionOutcome.INJECTED.value
+        self.incarnation_is_current = _RecordingRemoteMethod(name="incarnation_is_current", calls=self.calls)
+        self.incarnation_is_current.result = True
         self.stop_cell_incarnation = _RecordingRemoteMethod(name="stop_cell_incarnation", calls=self.calls)
 
 
@@ -80,7 +88,11 @@ class TestRayCellOperationsDisruptiveOperations:
         )
 
         assert fixture.worker_manager.calls == [
-            ("inject_fault", ("engine-0-2",), {"mode": "sigkill", "worker_in_cell_index": 0})
+            (
+                "inject_fault",
+                ("engine-0-2",),
+                {"mode": "sigkill", "worker_in_cell_index": 0, "expected_workers_hash": None},
+            )
         ]
 
     async def test_a_trainer_cells_fault_reaches_the_worker_manager(self) -> None:
@@ -93,7 +105,11 @@ class TestRayCellOperationsDisruptiveOperations:
         )
 
         assert fixture.worker_manager.calls == [
-            ("inject_fault", (_TRAINER_CELL_ID,), {"mode": "sigkill", "worker_in_cell_index": 0})
+            (
+                "inject_fault",
+                (_TRAINER_CELL_ID,),
+                {"mode": "sigkill", "worker_in_cell_index": 0, "expected_workers_hash": None},
+            )
         ]
 
     async def test_a_cell_the_controller_never_listed_is_still_crashed(self) -> None:
@@ -105,7 +121,11 @@ class TestRayCellOperationsDisruptiveOperations:
         )
 
         assert fixture.worker_manager.calls == [
-            ("inject_fault", ("engine-0-7",), {"mode": "sigkill", "worker_in_cell_index": 0})
+            (
+                "inject_fault",
+                ("engine-0-7",),
+                {"mode": "sigkill", "worker_in_cell_index": 0, "expected_workers_hash": None},
+            )
         ]
 
 
@@ -189,3 +209,33 @@ class TestRayCellOperationsTerminateIncarnation:
 
         with pytest.raises(CellTerminationNotConfirmedError):
             await fixture.operations.terminate_incarnation(cell_id=_TRAINER_CELL_ID, expected_workers_hash="hash-1")
+
+
+class TestRayCellOperationsIncarnationBoundInjection:
+    async def test_the_expected_incarnation_travels_with_the_request(self) -> None:
+        """The manager is the only place that can compare it against membership without a window."""
+        fixture = _make_fixture()
+
+        outcome = await fixture.operations.inject_fault(
+            cell_id="engine-0-2", mode=FailureMode.SIGKILL, sub_index=0, expected_workers_hash="hash-1"
+        )
+
+        assert outcome is FaultInjectionOutcome.INJECTED
+        assert fixture.worker_manager.calls == [
+            (
+                "inject_fault",
+                ("engine-0-2",),
+                {"mode": "sigkill", "worker_in_cell_index": 0, "expected_workers_hash": "hash-1"},
+            )
+        ]
+
+    async def test_a_stale_verdict_is_reported_back_to_the_caller(self) -> None:
+        """A fault that was refused must not be counted as harm done to the cell it named."""
+        fixture = _make_fixture()
+        fixture.worker_manager.inject_fault.result = FaultInjectionOutcome.STALE.value
+
+        outcome = await fixture.operations.inject_fault(
+            cell_id="engine-0-2", mode=FailureMode.SIGKILL, sub_index=0, expected_workers_hash="hash-1"
+        )
+
+        assert outcome is FaultInjectionOutcome.STALE

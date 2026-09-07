@@ -209,6 +209,7 @@ def _compute_spec_trainer(
     return ServeWorkerSpec(
         name=compute_trainer_pool_id(trainer_id),
         category=POOL_CATEGORY_TRAINER_ENGINE,
+        platform_access=PlatformAccess.READ_DELETE if args.use_fault_tolerance else PlatformAccess.NONE,
         deploy_component=DeployComponent.TRAINER,
         port_infos=[PortInfo(name=MASTER_PORT_NAME, static_port=9000, mode="master", allow_dynamic=True)],
         env_var=lambda ctx: compute_trainer_env_vars(args, ctx, fp8_scales=fp8_scales),
@@ -229,6 +230,7 @@ def _compute_spec_trainer(
             rank=ctx.worker_in_cell_index,
             role=config.role,
             cell_index=ctx.cell_index,
+            capability=ctx.capability,
         ),
         concurrency_groups=TRAINER_CONCURRENCY_GROUPS if args.use_fault_tolerance else None,
         meta=lambda ctx: dict(role=config.role, cell_index=ctx.cell_index),

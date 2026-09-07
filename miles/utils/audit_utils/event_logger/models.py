@@ -153,6 +153,11 @@ class FaultHookFireEvent(EventBase):
     mode: str
     request_id: str
     weight_version: int | None = None
+    target: str = "local"
+    outcome: str = "fired"
+    victim_cell_id: str | None = None
+    victim_workers_hash: str | None = None
+    victim_worker_in_cell_index: int | None = None
 
 
 class MetricEvent(EventBase):

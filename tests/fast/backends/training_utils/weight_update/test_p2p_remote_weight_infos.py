@@ -10,6 +10,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from miles.backends.sglang_utils.sglang_api_client import RemoteInstanceTransferEngineInfo
+
 _MODULE = "miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils"
 
 
@@ -31,7 +33,11 @@ class _FakeRolloutEngine:
 
     async def get_remote_instance_transfer_engine_info(self, rank: int):
         self.calls.append(("get_remote_instance_transfer_engine_info", {"rank": rank}))
-        return f"session-{self._engine_index}-{rank}", {f"weight-{rank}": (0x1000 + rank, 4, 2)}
+        session_id = f"session-{self._engine_index}-{rank}"
+        return RemoteInstanceTransferEngineInfo(
+            session_id=session_id,
+            weights_info={f"weight-{rank}": (0x1000 + rank, 4, 2)},
+        )
 
     async def get_parallelism_info(self, rank: int):
         self.calls.append(("get_parallelism_info", {"rank": rank}))
@@ -44,8 +50,11 @@ class _FakeRolloutEngine:
 
 class _JsonRolloutEngine(_FakeRolloutEngine):
     async def get_remote_instance_transfer_engine_info(self, rank: int):
-        session_id, weights_info = await super().get_remote_instance_transfer_engine_info(rank)
-        return session_id, {name: list(location) for name, location in weights_info.items()}
+        info = await super().get_remote_instance_transfer_engine_info(rank)
+        return RemoteInstanceTransferEngineInfo(
+            session_id=info.session_id,
+            weights_info={name: list(location) for name, location in info.weights_info.items()},
+        )
 
 
 @contextmanager
@@ -159,7 +168,9 @@ class TestQueryRemoteWeightInfos:
             (0, 1): "session-0-1",
             (1, 0): "session-1-0",
         }
-        assert weight_infos == {
+        assert {
+            session_id: (info.weights_info, info.parallelism_info) for session_id, info in weight_infos.items()
+        } == {
             "session-0-0": ({"weight-0": (0x1000, 4, 2)}, {"tp_rank": 0}),
             "session-0-1": ({"weight-1": (0x1001, 4, 2)}, {"tp_rank": 1}),
             "session-1-0": ({"weight-0": (0x1000, 4, 2)}, {"tp_rank": 0}),
@@ -196,7 +207,7 @@ class _DeadRolloutEngine(_FakeRolloutEngine):
 class _NamelessRolloutEngine(_FakeRolloutEngine):
     async def get_remote_instance_transfer_engine_info(self, rank: int):
         self.calls.append(("get_remote_instance_transfer_engine_info", {"rank": rank}))
-        return None, {}
+        return RemoteInstanceTransferEngineInfo(session_id="", weights_info={})
 
 
 class TestQueryFailureAttribution:
@@ -342,7 +353,6 @@ def _plan_query(p2p_transfer_utils, monkeypatch, *, pairs, blocking):
                 weights_info={},
                 parallelism_info={"tp_rank": engine_rank},
                 server_info={"model_path": f"/model/{engine_ind}"},
-                receiver_identity=None,
             ),
         )
         return futures[target]

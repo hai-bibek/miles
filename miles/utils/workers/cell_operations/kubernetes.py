@@ -8,12 +8,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import aiohttp
+
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.base import (
     TERMINATE_INCARNATION_TIMEOUT_SECONDS,
     BaseCellOperations,
     CellTerminationNotConfirmedError,
     CellTerminationOutcome,
+    FaultInjectionOutcome,
 )
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
 from miles.utils.workers.worker_provider.base import CellInfo, StopWatchFn
@@ -110,11 +113,51 @@ class KubernetesCellOperations(BaseCellOperations):
         await self._wait_until_pods_are_gone(cell_id=cell_id, pods=incarnation.pods, deadline=deadline)
         return CellTerminationOutcome.TERMINATED
 
-    async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None:
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: FailureMode,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+    ) -> FaultInjectionOutcome:
         await self._ensure_watching()
 
+        assert sub_index is not None, f"a fault aimed at a worker of {cell_id} needs the index of that worker"
+        if expected_workers_hash is not None:
+            incarnation = self._provider.cell_incarnation(cell_id)
+            if incarnation is None or incarnation.workers_hash != expected_workers_hash:
+                return FaultInjectionOutcome.STALE
+            pod_name = self._provider.pod_name_of_worker(cell_id=cell_id, sub_index=sub_index)
+            pod = next(pod for pod in incarnation.pods if pod.name == pod_name)
+            try:
+                return await asyncio.wait_for(
+                    _inject_fault_in_pod(namespace=self._namespace, pod=pod, mode=mode),
+                    timeout=INJECT_FAULT_TIMEOUT_SECONDS,
+                )
+            except (TimeoutError, ConnectionError, aiohttp.ClientError):
+                logger.exception("Pod %s did not confirm fault injection", pod.name)
+                return FaultInjectionOutcome.UNKNOWN
         worker_name, handle = self._resolve_handle(cell_id=cell_id, sub_index=sub_index, purpose="crash it")
         await _inject_fault_over_rpc(handle=handle, mode=mode, worker_name=worker_name)
+        return FaultInjectionOutcome.INJECTED
+
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool:
+        await self._ensure_watching()
+
+        incarnation = self._provider.cell_incarnation(cell_id)
+        if incarnation is None:
+            logger.warning("Cell %s is no longer observed, so %s cannot be current", cell_id, expected_workers_hash)
+            return False
+        if incarnation.workers_hash != expected_workers_hash:
+            logger.warning(
+                "Cell %s now runs %s, not the %s the request was issued against",
+                cell_id,
+                incarnation.workers_hash,
+                expected_workers_hash,
+            )
+            return False
+        return True
 
     def _resolve_handle(self, *, cell_id: str, sub_index: int, purpose: str) -> tuple[str, BaseWorkerHandle]:
         (infos,) = self._provider.get_worker_infos(cell_ids=[cell_id])
@@ -225,6 +268,63 @@ def _reported_container(pod: PodIdentity, *, name: str) -> ContainerIdentity | N
     if len(reported) != 1 or len(pod.containers) != 1:
         return None
     return reported[0]
+
+
+async def _inject_fault_in_pod(*, namespace: str, pod: PodIdentity, mode: FailureMode) -> FaultInjectionOutcome:
+    from kubernetes_asyncio import client as kubernetes_client
+    from kubernetes_asyncio.stream import WsApiClient
+
+    signals = {FailureMode.SIGKILL: "-KILL"}
+    if mode not in signals:
+        raise ValueError(f"Unsupported inference cell fault: {mode.value}")
+    container = _sole_declared_container_name(pod)
+    assert container is not None, f"Pod {pod.name} must name one worker container"
+
+    async with _core_v1_api() as api:
+        try:
+            observed = await api.read_namespaced_pod(name=pod.name, namespace=namespace)
+        except kubernetes_client.ApiException as error:
+            if error.status == 404:
+                return FaultInjectionOutcome.STALE
+            raise
+    if observed.metadata.uid != pod.uid:
+        return FaultInjectionOutcome.STALE
+    assert not observed.spec.host_pid, f"Cannot inject a pod-wide fault into host PID namespace: {pod.name}"
+    before = _reported_container(pod, name=container)
+    after = next((item for item in observed.status.container_statuses or [] if item.name == container), None)
+    if before is None or after is None or not before.container_id or after.container_id != before.container_id:
+        return FaultInjectionOutcome.STALE
+
+    async with WsApiClient() as api_client:
+        api = kubernetes_client.CoreV1Api(api_client=api_client)
+        connection = await api.connect_get_namespaced_pod_exec(
+            name=pod.name,
+            namespace=namespace,
+            container=container,
+            command=["sh", "-c", f"pkill {signals[mode]} -f '[s]glang::'"],
+            stdin=False,
+            stdout=True,
+            stderr=True,
+            tty=False,
+            _preload_content=False,
+        )
+        async with connection as websocket:
+            return await _read_exec_outcome(websocket)
+
+
+async def _read_exec_outcome(websocket: Any) -> FaultInjectionOutcome:
+    from aiohttp import WSMsgType
+    from kubernetes_asyncio.stream import WsApiClient
+
+    async for message in websocket:
+        if message.type == WSMsgType.ERROR:
+            raise ConnectionError(f"Pod exec websocket failed: {websocket.exception()}")
+        if message.type == WSMsgType.BINARY and message.data and message.data[0] == 3:
+            exit_code = WsApiClient.parse_error_data(message.data[1:])
+            if exit_code != 0:
+                raise RuntimeError(f"Pod fault command exited with code {exit_code}")
+            return FaultInjectionOutcome.INJECTED
+    return FaultInjectionOutcome.UNKNOWN
 
 
 async def _inject_fault_over_rpc(*, handle: BaseWorkerHandle, mode: FailureMode, worker_name: str) -> None:

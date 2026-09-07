@@ -82,6 +82,11 @@ class KubernetesWorkerProvider(BaseWorkerProvider):
     def pod_names_of_cell(self, cell_id: str) -> list[str]:
         return [pod.name for pod in self._pods_of_cell(cell_id)]
 
+    def pod_name_of_worker(self, *, cell_id: str, sub_index: int) -> str:
+        workers = self._workers_of_cell(cell_id)
+        assert 0 <= sub_index < len(workers), f"Worker index {sub_index} is out of range for {cell_id}"
+        return workers[sub_index].pod.name
+
     def _cell_id_of_pod(self, pod: Pod) -> str | None:
         parsed = pod_view.parse_pod(pod, self._run.label_keys)
         if parsed is None or parsed.pool_id not in self._pool_ids:

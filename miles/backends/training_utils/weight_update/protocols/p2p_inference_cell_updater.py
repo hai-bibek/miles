@@ -8,6 +8,13 @@ import torch
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.backends.training_utils.weight_update.protocols.p2p_cell_executor import _CellWriteExecutor
 from miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils import RemoteWeightInfo
+from miles.utils.test_utils.fault_hooks import (
+    FaultHookName,
+    RemoteInferenceTarget,
+    WeightUpdateSpan,
+    current_weight_update_span,
+    reach_fault_hook,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,7 @@ class P2PInferenceCellUpdater:
         self._disposed = False
         self._target_by_engine_rank = targets_by_engine_rank
         self._pending_writes: list[Future] = []
+        self._workers_hash: str | None = None
 
     @property
     def is_errored(self) -> bool:
@@ -45,18 +53,32 @@ class P2PInferenceCellUpdater:
     def mark_errored(self, error: BaseException) -> None:
         self._health.mark_errored(self.cell_id, error)
 
+    def bind_incarnation(self, workers_hash: str) -> None:
+        self._workers_hash = workers_hash
+
+    def remote_target_of(self, target: RemoteWeightInfo) -> RemoteInferenceTarget | None:
+        if self._workers_hash is None:
+            return None
+        return RemoteInferenceTarget(cell_id=self.cell_id, workers_hash=self._workers_hash)
+
     def submit_write(
         self, engine_rank: int, names: list[str], weight_memory_registry: dict[str, tuple[int, int, int]]
     ) -> Future | None:
         if not self.accepts_writes:
             return None
+        target = self._target_by_engine_rank[engine_rank]
+        span = current_weight_update_span()
         future = self._executor.submit(
             self._write_if_active,
-            self._target_by_engine_rank[engine_rank],
+            target,
             names,
             weight_memory_registry,
+            span,
         )
         self._pending_writes.append(future)
+        reach_fault_hook(
+            FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT, remote_target=self.remote_target_of(target), span=span
+        )
         return future
 
     def wait_for_write(self, future: Future | None) -> None:
@@ -106,11 +128,19 @@ class P2PInferenceCellUpdater:
         target: RemoteWeightInfo,
         names: list[str],
         weight_memory_registry: dict[str, tuple[int, int, int]],
+        span: WeightUpdateSpan | None = None,
     ) -> None:
         if not self.accepts_writes:
             logger.warning(f"[P2P-Shared] skipping a queued write to cell {self.cell_id}")
             return
-        _write_one_target(self._transfer_engine, target, names, weight_memory_registry)
+        _write_one_target(
+            self._transfer_engine,
+            target,
+            names,
+            weight_memory_registry,
+            remote_target=self.remote_target_of(target),
+            span=span,
+        )
 
 
 class TransferEngineMeta(NamedTuple):
@@ -124,6 +154,9 @@ def _write_one_target(
     target: RemoteWeightInfo,
     names: list[str],
     weight_memory_registry: dict[str, tuple[int, int, int]],
+    *,
+    remote_target: RemoteInferenceTarget | None,
+    span: WeightUpdateSpan | None,
 ) -> None:
     """P2P write from shared CPU pinned buffers to a single remote session.
 
@@ -162,6 +195,11 @@ def _write_one_target(
         f"source: {len(source_ptrs)}, target: {len(target_ptrs)}"
     )
 
+    reach_fault_hook(
+        FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE,
+        remote_target=remote_target,
+        span=span,
+    )
     ret = transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
     if ret < 0:
         raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")

@@ -11,6 +11,7 @@ from miles.utils.workers.cell_operations.base import (
     BaseCellOperations,
     CellTerminationNotConfirmedError,
     CellTerminationOutcome,
+    FaultInjectionOutcome,
 )
 from miles.utils.workers.worker_provider.base import CellInfo
 
@@ -54,8 +55,27 @@ class RayCellOperations(BaseCellOperations):
             )
         return CellTerminationOutcome(outcome)
 
-    async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None:
-        await self._worker_manager_handle.inject_fault.remote(cell_id, mode=mode.value, worker_in_cell_index=sub_index)
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: FailureMode,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+    ) -> FaultInjectionOutcome:
+        assert sub_index is not None, f"a fault aimed at a worker of {cell_id} needs the index of that worker"
+        outcome = await self._worker_manager_handle.inject_fault.remote(
+            cell_id,
+            mode=mode.value,
+            worker_in_cell_index=sub_index,
+            expected_workers_hash=expected_workers_hash,
+        )
+        return FaultInjectionOutcome(outcome)
+
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool:
+        return await self._worker_manager_handle.incarnation_is_current.remote(
+            cell_id, expected_workers_hash=expected_workers_hash
+        )
 
 
 async def _stop_cell_incarnation(

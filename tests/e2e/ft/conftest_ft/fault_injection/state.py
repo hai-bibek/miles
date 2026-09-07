@@ -100,3 +100,7 @@ def cell_workers_hash(cell: dict) -> str:
     workers_hash = cell["status"]["workers_hash"]
     assert workers_hash, f"cell {cell['metadata']['name']} reports no worker generation"
     return workers_hash
+
+
+def cell_info_is_in_service(info: CellInfo) -> bool:
+    return info.alive and (info.cell_type != "rollout" or info.state is ObservedCellState.SERVING)

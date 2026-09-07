@@ -31,6 +31,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: {{ if eq $level.access "read" }}["get", "list", "watch"]{{ else }}["get", "list", "watch", "delete"]{{ end }}
+  {{- if ne $level.access "read" }}
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  {{- end }}
   {{- if and (ne $level.access "read") (include "miles-run.autoUninstallEnabled" $context) }}
   - apiGroups: ["batch"]
     resources: ["jobs"]

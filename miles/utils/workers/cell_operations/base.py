@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import abc
 import enum
+import logging
 
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.worker_provider.base import CellInfo
 
+logger = logging.getLogger(__name__)
+
 TERMINATE_INCARNATION_TIMEOUT_SECONDS = 120.0
 CELL_TERMINATION_NOT_CONFIRMED = "not_confirmed"
+INCARNATION_CHECK_TIMEOUT_SECONDS = 30.0
+
+
+class FaultInjectionOutcome(enum.Enum):
+    INJECTED = "injected"
+    ACCEPTED = "accepted"
+    STALE = "stale"
+    UNKNOWN = "unknown"
 
 
 class CellTerminationOutcome(enum.Enum):
@@ -40,4 +51,14 @@ class BaseCellOperations(abc.ABC):
     ) -> CellTerminationOutcome: ...
 
     @abc.abstractmethod
-    async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None: ...
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: FailureMode,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+    ) -> FaultInjectionOutcome: ...
+
+    @abc.abstractmethod
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool: ...

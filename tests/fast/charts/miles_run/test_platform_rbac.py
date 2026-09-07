@@ -62,6 +62,7 @@ class TestTheAccountsAReleaseGrantsItsPlatformClients:
         assert named_object(objects, "RoleBinding", RUN_PLATFORM_READ_DELETE_NAME)
         assert named_object(objects, "Role", RUN_PLATFORM_READ_DELETE_NAME)["rules"] == [
             {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "delete"]},
+            {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get", "create"]},
             {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"]},
         ]
 
@@ -88,6 +89,7 @@ class TestTheAccountsAReleaseGrantsItsPlatformClients:
         assert named_object(objects, "ServiceAccount", RUN_PLATFORM_READ_DELETE_NAME)
         assert named_object(objects, "Role", RUN_PLATFORM_READ_DELETE_NAME)["rules"] == [
             {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "delete"]},
+            {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get", "create"]},
             {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"]},
         ]
         assert (

@@ -1,7 +1,7 @@
 import json
 import logging
 from argparse import Namespace
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from typing import Any
 
@@ -31,8 +31,10 @@ from miles.backends.training_utils.weight_update.protocols.p2p_inference_cell_up
 )
 from miles.backends.training_utils.weight_update.utils import ModelParamStager
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.test_utils.fault_hooks import FaultHookName, reach_fault_hook
 
 from .p2p_transfer_utils import (
+    RemoteSessionInfo,
     RemoteTransferPlan,
     RemoteWeightInfo,
     create_transfer_engine,
@@ -74,7 +76,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self._cell_updaters_by_cell_id: dict[str, P2PInferenceCellUpdater] = {}
         self._unfinished_writes: list[Future] = []
         self._stalled_executors: list[_CellWriteExecutor] = []
-        self.remote_weight_infos_by_session_id: dict[str, tuple] = {}
+        self.remote_weight_infos_by_session_id: dict[str, RemoteSessionInfo] = {}
         self.session_id_to_server_args: dict[str, ServerArgs] = {}
         # in self._transfer_engine_meta_list: tuple of
         # - single CPU replica shared among all sessions
@@ -88,6 +90,12 @@ class UpdateWeightP2P(WeightTransferProtocol):
         for cell_updater in self._cell_updaters_by_cell_id.values():
             cell_updater.wait_for_pending_writes()
         self._model_param_stager.assert_all_done()
+        reach_fault_hook(FaultHookName.WEIGHT_UPDATE_AFTER_BASE_WEIGHTS)
+
+    def bind_target_incarnations(self, workers_hash_of_cell_id: Mapping[str, str]) -> None:
+        for cell_id, cell_updater in self._cell_updaters_by_cell_id.items():
+            if (workers_hash := workers_hash_of_cell_id.get(cell_id)) is not None:
+                cell_updater.bind_incarnation(workers_hash)
 
     def begin_sync(
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
@@ -194,11 +202,10 @@ class UpdateWeightP2P(WeightTransferProtocol):
                     continue
                 targets_grouped_by_engine_rank.setdefault(target.engine_rank, []).append(target)
                 session_id = targets_to_session_id[(target.engine_ind, target.engine_rank)]
+                session_info = self.remote_weight_infos_by_session_id[session_id]
                 cell_targets = targets_by_cell_id[engine_cell_ids[target.engine_ind]]
                 assert target.engine_rank not in cell_targets
-                cell_targets[target.engine_rank] = RemoteWeightInfo(
-                    session_id, self.remote_weight_infos_by_session_id[session_id][0]
-                )
+                cell_targets[target.engine_rank] = RemoteWeightInfo(session_id, session_info.weights_info)
 
         self._cell_updaters_by_cell_id = {
             cell_id: P2PInferenceCellUpdater(
@@ -215,7 +222,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
             rank_session_ids = [targets_to_session_id[(t.engine_ind, t.engine_rank)] for t in rank_targets]
             self._assert_one_weight_representation(engine_rank=engine_rank, session_ids=rank_session_ids)
             model_replica = self._ensure_cpu_replica(
-                parallelism_info=self.remote_weight_infos_by_session_id[rank_session_ids[0]][1],
+                parallelism_info=self.remote_weight_infos_by_session_id[rank_session_ids[0]].parallelism_info,
                 server_args=self.session_id_to_server_args[rank_session_ids[0]],
             )
 
@@ -264,7 +271,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def _assert_one_weight_representation(self, engine_rank: int, session_ids: list[str]) -> None:
         keys_by_session = {
             session_id: _weight_representation_key(
-                self.remote_weight_infos_by_session_id[session_id][1], self.session_id_to_server_args[session_id]
+                self.remote_weight_infos_by_session_id[session_id].parallelism_info,
+                self.session_id_to_server_args[session_id],
             )
             for session_id in session_ids
         }

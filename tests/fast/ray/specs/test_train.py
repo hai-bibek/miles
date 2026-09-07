@@ -264,6 +264,13 @@ class TestConstructorArguments:
 
         assert spec.ctor_kwargs(_make_context())["world_size"] == 4
 
+    def test_the_worker_is_handed_the_backend_capability(self):
+        """A remote fault armed in this worker is delivered through cell operations it can only get here."""
+        (spec,) = specs_trainer(_make_args())
+        context = _make_context()
+
+        assert spec.ctor_kwargs(context)["capability"] is context.capability
+
     def test_no_quorum_store_address_is_baked_into_the_spec(self, monkeypatch):
         """Every pod recomputes the spec, so an address minted here would give each pod its own quorum."""
         monkeypatch.setattr("miles.ray.specs.train.compute_megatron_world_size_except_dp", lambda _args: 2)
@@ -979,3 +986,11 @@ class TestProviderSelection:
 
         assert provider is capability.static_provider
         assert capability.requested_static_pool_ids == ["trainer-controller-actor"]
+
+
+class TestFaultHookPlatformAccess:
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_only_ft_trainers_receive_cell_control_access(self, enabled: bool) -> None:
+        """A trainer firing remote fault hooks must be able to watch and exec inference pods."""
+        (spec,) = specs_trainer(_make_args(use_fault_tolerance=enabled))
+        assert spec.platform_access is (PlatformAccess.READ_DELETE if enabled else PlatformAccess.NONE)

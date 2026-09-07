@@ -16,7 +16,7 @@ from tests.e2e.ft.conftest_ft.hook_injection import (
     run_targeted_hook_scenario,
 )
 
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 app: typer.Typer = typer.Typer()
@@ -38,6 +38,7 @@ def run_ci(mode: ModeOption, num_steps: NumStepsOption = DEFAULT_NUM_STEPS) -> N
         num_steps=num_steps,
         hook=HOOK,
         failure_mode=FAILURE_MODE,
+        target=FaultHookTarget.LOCAL,
         request_id=REQUEST_ID,
         sub_index=ARMED_WORKER_IN_CELL_INDEX,
     )

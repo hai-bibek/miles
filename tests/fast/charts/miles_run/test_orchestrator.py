@@ -104,6 +104,7 @@ class TestOrchestratorIdentity:
 
         assert role["rules"] == [
             {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "delete"]},
+            {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get", "create"]},
             {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"]},
         ]
         assert binding["roleRef"]["name"] == ORCHESTRATOR_ACCOUNT

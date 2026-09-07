@@ -27,6 +27,7 @@ from tests.e2e.ft.conftest_ft.fault_injection.state import (
     EventLog,
     ObservationsEvent,
     ObservedCellState,
+    cell_info_is_in_service,
     cell_is_alive,
     cell_type_of,
     cell_workers_hash,
@@ -46,7 +47,7 @@ from miles.utils.audit_utils.event_logger.models import (
 )
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 from miles.utils.external_utils import command_utils
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookOutcome, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.test_utils.polling_worker import PollingWorker
 from miles.utils.workers.naming import compute_cell_id, parse_cell_id
@@ -57,10 +58,15 @@ CHECKPOINT_TRACKER_FILENAME: str = "latest_checkpointed_iteration.txt"
 CHECKPOINT_DIRNAME: str = "ckpt"
 
 P2P_WEIGHT_TRANSFER_ARGS: str = (
-    "--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    "--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine " ""
 )
 
 ARMED_TRAINER_MODEL_ID: str | None = None
+
+_EXPECTED_OUTCOME_OF_TARGET: dict[FaultHookTarget, FaultHookOutcome] = {
+    FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
+    FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
+}
 
 POLL_INTERVAL_SECONDS: float = 2.0
 ARM_REQUEST_TIMEOUT_SECONDS: float = 60.0
@@ -93,6 +99,7 @@ def run_targeted_hook_scenario(
     num_steps: int,
     hook: FaultHookName,
     failure_mode: FailureMode,
+    target: FaultHookTarget,
     request_id: str,
     sub_index: int,
 ) -> TargetedHookRun:
@@ -103,7 +110,7 @@ def run_targeted_hook_scenario(
     dump_dir: str = resolve_dump_dir(f"{test_name}_{mode}", run_id=config.run_id)
     print(f"Dump directory: {dump_dir}")
     print(f"Steps: {num_steps}, cluster backend: {config.cluster_backend.value}")
-    print(f"Arming {hook.value} ({failure_mode.value}) as {request_id!r}")
+    print(f"Arming {hook.value} ({failure_mode.value}, {target.value}) as {request_id!r}")
 
     prepare(ft_mode, config=config)
 
@@ -126,6 +133,7 @@ def run_targeted_hook_scenario(
         sub_index=sub_index,
         hook=hook,
         mode=failure_mode,
+        target=target,
         request_id=request_id,
     )
     armer.start()
@@ -183,6 +191,7 @@ class ArmedFaultHook:
     sub_index: int
     hook: FaultHookName
     mode: FailureMode
+    target: FaultHookTarget
     request_id: str
     expected_source: TrainProcessIdentity
     trainer_workers_hash: str
@@ -207,6 +216,7 @@ def arm_fault_hook_over_api(
     sub_index: int,
     hook: FaultHookName,
     mode: FailureMode,
+    target: FaultHookTarget,
     request_id: str,
     trainer_snapshot: CellSnapshot,
     inference_snapshot: CellSnapshot,
@@ -218,6 +228,7 @@ def arm_fault_hook_over_api(
             "expected_workers_hash": trainer_workers_hash,
             "hook": hook.value,
             "mode": mode.value,
+            "target": target.value,
             "sub_index": sub_index,
             "request_id": request_id,
         },
@@ -229,6 +240,7 @@ def arm_fault_hook_over_api(
         sub_index=sub_index,
         hook=hook,
         mode=mode,
+        target=target,
         request_id=request_id,
         expected_source=TrainProcessIdentity(
             component=ACTOR_ROLE,
@@ -255,6 +267,7 @@ class HookArmer:
         sub_index: int,
         hook: FaultHookName,
         mode: FailureMode,
+        target: FaultHookTarget,
         request_id: str,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
     ) -> None:
@@ -268,6 +281,7 @@ class HookArmer:
         self._sub_index = sub_index
         self._hook = hook
         self._mode = mode
+        self._target = target
         self._request_id = request_id
 
         def observe_and_arm(stop_event: threading.Event) -> None:
@@ -306,6 +320,7 @@ class HookArmer:
             sub_index=self._sub_index,
             hook=self._hook,
             mode=self._mode,
+            target=self._target,
             request_id=self._request_id,
             trainer_snapshot=trainer_snapshot,
             inference_snapshot=compute_cell_snapshot(cells, cell_type=ROLLOUT_CELL_TYPE),
@@ -394,6 +409,16 @@ def assert_hook_fired(armed: ArmedFaultHook, *, event_dir: Path) -> FaultHookFir
     assert fire.weight_version is not None, (
         f"Fault hook witness failed: request {armed.request_id!r} fired outside any weight update, so nothing names "
         f"the update whose targets the run then holds responsible"
+    )
+    assert fire.target == armed.target.value, (
+        f"Fault hook witness failed: request {armed.request_id!r} fired against {fire.target}, not the "
+        f"{armed.target.value} it was armed for"
+    )
+    expected_outcome = _EXPECTED_OUTCOME_OF_TARGET[armed.target]
+    assert fire.outcome == expected_outcome.value, (
+        f"Fault hook witness failed: request {armed.request_id!r} reached its point and answered {fire.outcome}, not "
+        f"the {expected_outcome.value} a delivered {armed.target.value} fault records; a refusal, an unknown answer "
+        f"or an incarnation that was already gone harmed nobody"
     )
     print(f"Fault hook fire witness passed: {fire.hook} fired once in {fire.source} for request {armed.request_id!r}")
     return fire
@@ -569,6 +594,36 @@ def assert_unrelated_target_kept_serving(
     return survivors[0]
 
 
+def assert_remote_fault_isolated(
+    events: list[Event],
+    *,
+    armed: ArmedFaultHook,
+    assignment: WeightUpdateAssignmentEvent,
+    victim: str,
+    since: datetime,
+) -> None:
+    siblings = {
+        cell_id: workers_hash
+        for cell_id, workers_hash in assignment.assigned_workers_hash_of_cell_id.items()
+        if cell_id != victim
+    }
+    assert siblings, "Remote isolation witness failed: the sender has no sibling target to check"
+
+    observations = [event for event in events if isinstance(event, ObservationsEvent) and event.timestamp >= since]
+    protected = siblings | {armed.cell_name: armed.trainer_workers_hash}
+    for cell_id, workers_hash in protected.items():
+        observed = [event.cell_infos.get(cell_id) for event in observations]
+        assert observed and all(info is not None and info.workers_hash == workers_hash for info in observed), (
+            f"Remote isolation witness failed: {cell_id} did not keep incarnation {workers_hash} "
+            f"after the fault aimed at {victim}"
+        )
+        assert any(
+            cell_info_is_in_service(info) for info in observed
+        ), f"Remote isolation witness failed: {cell_id} never returned to service after the fault aimed at {victim}"
+
+    assert_unrelated_target_kept_serving(events, armed=armed, assignment=assignment, since=since)
+
+
 def assert_weights_published_after(event_dir: Path, *, after: datetime) -> None:
     published = [
         event
@@ -634,3 +689,60 @@ def _was_serving_after(
             continue
         return True
     return False
+
+
+# ============================== remote victim witnesses ==============================
+
+
+def assert_remote_victim_was_harmed(
+    fire: FaultHookFireEvent, events: list[Event], *, armed: ArmedFaultHook, assignment: WeightUpdateAssignmentEvent
+) -> str:
+    victim = fire.victim_cell_id
+    assert victim is not None and fire.victim_workers_hash is not None, (
+        f"Remote fault witness failed: the fire of request {fire.request_id!r} names no target, so no cell can be "
+        f"held to have been harmed"
+    )
+    assert assignment.assigned_workers_hash_of_cell_id.get(victim) == fire.victim_workers_hash, (
+        f"Remote fault witness failed: the write named {victim} at {fire.victim_workers_hash}, which is not what the "
+        f"update assigned this sender ({assignment.assigned_workers_hash_of_cell_id})"
+    )
+    assert fire.victim_worker_in_cell_index is not None, "Remote fault did not name a cell worker"
+    assert armed.inference_workers_hash_of_cell_id.get(victim) == fire.victim_workers_hash, (
+        f"Remote fault witness failed: {victim} was not running {fire.victim_workers_hash} when the hook was armed, "
+        f"so the fault was aimed at an incarnation this run never observed in service "
+        f"({armed.inference_workers_hash_of_cell_id})"
+    )
+
+    incarnations = compute_incarnations_of_cell(events, cell_type=ROLLOUT_CELL_TYPE)
+    last = _last_observation_of(events, cell_name=victim)
+    assert last is not None and not (last.workers_hash == fire.victim_workers_hash and last.alive), (
+        f"Remote fault witness failed: {victim} still runs {fire.victim_workers_hash} at the end of the run, so the "
+        f"write's own target survived the fault aimed at it (observed: {incarnations})"
+    )
+    print(f"Remote fault witness passed: {victim} lost the incarnation {fire.victim_workers_hash} the write reached")
+    return victim
+
+
+def assert_remote_victim_recovered(events: list[Event], *, fire: FaultHookFireEvent, since: datetime) -> None:
+    victim = fire.victim_cell_id
+    assert _was_serving_after(events, cell_name=victim, other_than=fire.victim_workers_hash, since=since), (
+        f"Remote fault witness failed: {victim} was never observed healthy and Serving under a replacement of "
+        f"{fire.victim_workers_hash}, so the run ended with the harmed engine missing"
+    )
+    print(f"Remote recovery witness passed: {victim} served again under a replacement of {fire.victim_workers_hash}")
+
+
+def compute_victim_harm_observed_at(
+    events: list[Event], *, fire: FaultHookFireEvent, armed: ArmedFaultHook
+) -> datetime:
+    for event in events:
+        if not isinstance(event, ObservationsEvent) or event.timestamp < armed.snapshot_at:
+            continue
+        info = event.cell_infos.get(fire.victim_cell_id)
+        if info is not None and info.workers_hash != fire.victim_workers_hash:
+            return event.timestamp
+
+    raise AssertionError(
+        f"Remote fault witness failed: {fire.victim_cell_id} was never observed under an incarnation other than the "
+        f"{fire.victim_workers_hash} the write reached, so the fault the run reports as delivered cost it nothing"
+    )

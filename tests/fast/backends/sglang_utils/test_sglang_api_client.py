@@ -11,6 +11,10 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 
 SERVER_URL = "http://fake-host:1234"
 
+_TRANSFER_ENGINE_INFO_PAYLOAD = {
+    "remote_instance_transfer_engine_info": ["session-0-2", {"weight-2": [4098, 4, 2]}],
+}
+
 
 class _FakeResponse:
     def __init__(self, status_code: int = 200, payload: dict | None = None, text: str = "", body: bytes | None = None):
@@ -311,13 +315,28 @@ async def test_every_remaining_post_method_wire_contract(client, recorder, call,
     assert len(recorder.calls) == 1
 
 
-async def test_get_remote_instance_transfer_engine_info_unwraps_the_response(client, monkeypatch):
-    """The method returns the inner field, not the whole JSON body."""
+async def test_get_remote_instance_transfer_engine_info_parses_the_response(client, monkeypatch):
+    """The method returns the session, the weight buffers and the receiver identity, not the whole JSON body."""
     rec = _Recorder()
-    rec.install(monkeypatch, responses=[_FakeResponse(payload={"remote_instance_transfer_engine_info": {"a": 1}})])
+    rec.install(monkeypatch, responses=[_FakeResponse(payload=_TRANSFER_ENGINE_INFO_PAYLOAD)])
 
-    assert await client.get_remote_instance_transfer_engine_info(rank=2) == {"a": 1}
+    info = await client.get_remote_instance_transfer_engine_info(rank=2)
+
+    assert (info.session_id, info.weights_info) == ("session-0-2", {"weight-2": (4098, 4, 2)})
     assert rec.calls[0][2]["params"] == {"rank": 2}
+
+
+async def test_get_remote_instance_transfer_engine_info_accepts_an_engine_without_fault_control(client, monkeypatch):
+    """An engine started without the receiver fault endpoint publishes no identity and must still transfer."""
+    rec = _Recorder()
+    rec.install(
+        monkeypatch,
+        responses=[_FakeResponse(payload={"remote_instance_transfer_engine_info": ["session-0-2", None]})],
+    )
+
+    info = await client.get_remote_instance_transfer_engine_info(rank=2)
+
+    assert (info.session_id, info.weights_info) == ("session-0-2", {})
 
 
 async def test_every_public_method_is_a_coroutine_function():
@@ -505,7 +524,7 @@ class TestInformationGetters:
     async def test_remote_instance_transfer_engine_info_targets_its_endpoint_with_a_bound(self, client, monkeypatch):
         """Endpoint name and the 5-second bound are part of this method's wire contract."""
         rec = _Recorder()
-        rec.install(monkeypatch, responses=[_FakeResponse(payload={"remote_instance_transfer_engine_info": {"a": 1}})])
+        rec.install(monkeypatch, responses=[_FakeResponse(payload=_TRANSFER_ENGINE_INFO_PAYLOAD)])
 
         await client.get_remote_instance_transfer_engine_info(rank=2)
 
@@ -577,7 +596,9 @@ class TestEveryRequestIsAuthenticated:
         rec = _Recorder()
         rec.install(
             monkeypatch,
-            responses=[_FakeResponse(payload={"weight_version": "v1", "remote_instance_transfer_engine_info": {}})],
+            responses=[
+                _FakeResponse(payload={"weight_version": "v1", "remote_instance_transfer_engine_info": ["s", {}]})
+            ],
         )
 
         await call(SGLangApiClient(server_url=SERVER_URL, api_key="secret"))
