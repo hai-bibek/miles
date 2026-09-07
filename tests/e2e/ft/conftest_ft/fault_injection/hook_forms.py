@@ -28,7 +28,13 @@ from miles.backends.megatron_utils.megatron_config import ACTOR_ROLE
 from miles.utils.audit_utils.event_logger.logger import read_events
 from miles.utils.audit_utils.event_logger.models import FaultHookFireEvent, WeightUpdateAssignmentEvent
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
-from miles.utils.test_utils.fault_hooks import REMOTE_CAPABLE_HOOKS, FaultHookName, FaultHookOutcome, FaultHookTarget
+from miles.utils.test_utils.fault_hooks import (
+    MAX_FAULT_HOOK_DELAY_MS,
+    REMOTE_CAPABLE_HOOKS,
+    FaultHookName,
+    FaultHookOutcome,
+    FaultHookTarget,
+)
 from miles.utils.test_utils.fault_injector import FailureMode
 
 logger = logging.getLogger(__name__)
@@ -43,10 +49,24 @@ ARM_REFUSAL_STATUS_CODES: frozenset[int] = frozenset({400, 404, 422})
 _ARM_REFUSAL_REASON_OF_STATUS_CODE: dict[int, str] = {400: "BadRequest", 404: "NotFound"}
 ARMED_TRAINER_MODEL_ID: str | None = None
 
+SOAK_DELAY_MS_MIN: int = 0
+SOAK_DELAY_MS_MAX: int = 1000
+
 EXPECTED_OUTCOME_OF_TARGET: dict[FaultHookTarget, FaultHookOutcome] = {
     FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
     FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
 }
+
+
+# =================================== delays ===================================
+
+
+def draw_fault_hook_delay_ms(rng: random.Random) -> int:
+    assert SOAK_DELAY_MS_MAX <= MAX_FAULT_HOOK_DELAY_MS, (
+        f"a delay of up to {SOAK_DELAY_MS_MAX}ms cannot be drawn for a hook that refuses anything over "
+        f"{MAX_FAULT_HOOK_DELAY_MS}ms, so every draw above it would be an arm the worker rejects"
+    )
+    return rng.randint(SOAK_DELAY_MS_MIN, SOAK_DELAY_MS_MAX)
 
 
 # ============================== source selection ==============================
@@ -160,9 +180,10 @@ class _BaseHookFaultForm(BaseFaultForm):
         )
         source = rng.choice(sources)
         hook = rng.choice(self.candidate_hooks())
+        delay_ms = draw_fault_hook_delay_ms(rng)
         request_id = f"soak-{self.name}-{rng.getrandbits(64):016x}"
 
-        self._note_arm(request_id=request_id, source=source, hook=hook, acknowledged=False)
+        self._note_arm(request_id=request_id, source=source, hook=hook, delay_ms=delay_ms, acknowledged=False)
         response = requests.post(
             f"{self._context.base_url}/api/v1/cells/{source.cell_name}/arm-fault-hook",
             json={
@@ -172,6 +193,7 @@ class _BaseHookFaultForm(BaseFaultForm):
                 "target": self.target.value,
                 "sub_index": HOOK_SOURCE_SUB_INDEX,
                 "request_id": request_id,
+                "delay_ms": delay_ms,
             },
             timeout=ARM_REQUEST_TIMEOUT_SECONDS,
         )
@@ -181,9 +203,11 @@ class _BaseHookFaultForm(BaseFaultForm):
             return
 
         response.raise_for_status()
-        self._note_arm(request_id=request_id, source=source, hook=hook, acknowledged=True)
+        self._note_arm(request_id=request_id, source=source, hook=hook, delay_ms=delay_ms, acknowledged=True)
 
-    def _note_arm(self, *, request_id: str, source: HookSource, hook: FaultHookName, acknowledged: bool) -> None:
+    def _note_arm(
+        self, *, request_id: str, source: HookSource, hook: FaultHookName, delay_ms: int, acknowledged: bool
+    ) -> None:
         self._context.event_log.note_hook_arm(
             request_id=request_id,
             form_name=self.name,
@@ -195,6 +219,7 @@ class _BaseHookFaultForm(BaseFaultForm):
             hook=hook.value,
             mode=HOOK_FAILURE_MODE.value,
             target=self.target.value,
+            delay_ms=delay_ms,
             acknowledged=acknowledged,
         )
 
@@ -359,6 +384,7 @@ class HookFireCollector:
                 expected_hook=harm.hook,
                 expected_mode=harm.mode,
                 expected_target=harm.target,
+                expected_delay_ms=harm.delay_ms,
                 expected_source=TrainProcessIdentity(
                     component=ACTOR_ROLE,
                     model_id=ARMED_TRAINER_MODEL_ID,
@@ -411,6 +437,7 @@ def compute_hook_fire_record(
     expected_hook: str,
     expected_mode: str,
     expected_target: str,
+    expected_delay_ms: int,
     expected_source: TrainProcessIdentity,
     expected_trainer_workers_hash: str,
     assignment: WeightUpdateAssignmentEvent | None,
@@ -420,6 +447,7 @@ def compute_hook_fire_record(
         expected_hook=expected_hook,
         expected_mode=expected_mode,
         expected_target=expected_target,
+        expected_delay_ms=expected_delay_ms,
         expected_source=expected_source,
         expected_trainer_workers_hash=expected_trainer_workers_hash,
         assignment=assignment,
@@ -446,6 +474,7 @@ def compute_hook_fire_record(
         mode=event.mode,
         target=event.target,
         outcome=event.outcome,
+        delay_ms=event.delay_ms,
         weight_version=event.weight_version,
         source_cell_index=source.cell_index if isinstance(source, TrainProcessIdentity) else None,
         source_rank_within_cell=source.rank_within_cell if isinstance(source, TrainProcessIdentity) else None,
@@ -463,6 +492,7 @@ def compute_hook_fire_identity_mismatch(
     expected_hook: str,
     expected_mode: str,
     expected_target: str,
+    expected_delay_ms: int,
     expected_source: TrainProcessIdentity,
     expected_trainer_workers_hash: str,
     assignment: WeightUpdateAssignmentEvent | None,
@@ -471,6 +501,8 @@ def compute_hook_fire_identity_mismatch(
         return f"fired as {event.hook}/{event.mode}, not the armed {expected_hook}/{expected_mode}"
     if event.target != expected_target:
         return f"fired against {event.target}, not the armed {expected_target}"
+    if event.delay_ms != expected_delay_ms:
+        return f"fired after a {event.delay_ms}ms delay, not the {expected_delay_ms}ms it was armed for"
     if event.source != expected_source:
         return f"fired in {event.source}, not in the armed {expected_source}"
     if event.weight_version is None:
