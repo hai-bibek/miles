@@ -1,5 +1,6 @@
 import os
 import shlex
+import signal
 import threading
 import time
 from pathlib import Path
@@ -197,17 +198,18 @@ class TestKillSubprocess:
 
 
 class TestInjectFault:
-    def test_a_sigkill_reaches_the_worker_process_group(self, monkeypatch: pytest.MonkeyPatch):
+    @pytest.mark.parametrize("mode, expected_signal", [("sigkill", signal.SIGKILL), ("sigstop", signal.SIGSTOP)])
+    def test_a_signal_reaches_the_worker_process_group(self, monkeypatch: pytest.MonkeyPatch, mode, expected_signal):
         """Crashing a worker must include every subprocess that belongs to that worker."""
-        killed: list[int] = []
+        killed: list[tuple[int, int]] = []
         monkeypatch.setattr(process_utils, "kill_process", _refuse_to_kill)
-        monkeypatch.setattr(process_utils, "kill_process_tree", lambda process: killed.append(process.pid))
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
         actor = CommandActor()
         actor._process = _FakeProcess(pid=4321)
 
-        actor.inject_fault("sigkill")
+        actor.inject_fault(mode)
 
-        assert killed == [4321]
+        assert killed == [(4321, expected_signal)]
 
     def test_a_sigkill_does_not_leave_a_spawned_engine_process_behind(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -230,12 +232,12 @@ class TestInjectFault:
 
     @pytest.mark.parametrize("mode", ["exit", "segfault", "deadlock"])
     def test_every_other_failure_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, mode: str):
-        """A process exits, segfaults and deadlocks from the inside; no signal an outsider sends reproduces that."""
+        """Only sigkill goes through the supervisor; a hang has to be aimed at the receiver process itself."""
         monkeypatch.setattr(process_utils, "kill_process_tree", _refuse_to_kill)
         actor = CommandActor()
         actor._process = _FakeProcess(pid=4321)
 
-        with pytest.raises(AssertionError, match="only sigkill"):
+        with pytest.raises(ValueError, match="Unsupported subprocess fault"):
             actor.inject_fault(mode)
 
     def test_an_unknown_mode_is_rejected(self):
@@ -249,7 +251,7 @@ class TestInjectFault:
     def test_the_actor_process_survives_the_injection(self, monkeypatch: pytest.MonkeyPatch):
         """Production loses the engine, not its supervisor, so crashing the actor would be the wrong fault."""
         monkeypatch.setattr(fault_injector, "inject_fault", _refuse_to_inject)
-        monkeypatch.setattr(process_utils, "kill_process_tree", lambda process: None)
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
         actor = CommandActor()
         actor._process = _FakeProcess(pid=4321)
 

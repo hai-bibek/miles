@@ -274,7 +274,7 @@ async def _inject_fault_in_pod(*, namespace: str, pod: PodIdentity, mode: Failur
     from kubernetes_asyncio import client as kubernetes_client
     from kubernetes_asyncio.stream import WsApiClient
 
-    signals = {FailureMode.SIGKILL: "-KILL"}
+    signals = {FailureMode.SIGKILL: "-KILL", FailureMode.SIGSTOP: "-STOP"}
     if mode not in signals:
         raise ValueError(f"Unsupported inference cell fault: {mode.value}")
     container = _sole_declared_container_name(pod)

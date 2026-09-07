@@ -961,11 +961,11 @@ class TestInferenceCellFaults:
         provider = IncarnationProvider(pods=[make_pod("p0")], workers_hash="new")
         operations = KubernetesCellOperations(provider=provider, namespace="test")
         outcome = await operations.inject_fault(
-            cell_id="engine-0", sub_index=0, mode=FailureMode.SIGKILL, expected_workers_hash="old"
+            cell_id="engine-0", sub_index=0, mode=FailureMode.SIGSTOP, expected_workers_hash="old"
         )
         assert outcome is FaultInjectionOutcome.STALE
 
-    @pytest.mark.parametrize("mode", [FailureMode.SIGKILL])
+    @pytest.mark.parametrize("mode", [FailureMode.SIGKILL, FailureMode.SIGSTOP])
     async def test_the_target_pod_and_signal_reach_exec(
         self, monkeypatch: pytest.MonkeyPatch, mode: FailureMode
     ) -> None:
@@ -1099,7 +1099,7 @@ class TestPodFaultCommand:
         monkeypatch.setattr(stream, "WsApiClient", WsClient)
 
         outcome = await cell_operations_kubernetes._inject_fault_in_pod(
-            namespace="test", pod=pod, mode=FailureMode.SIGKILL
+            namespace="test", pod=pod, mode=FailureMode.SIGSTOP
         )
         if replacement is not None:
             assert outcome is FaultInjectionOutcome.STALE
@@ -1111,7 +1111,7 @@ class TestPodFaultCommand:
                     name="p0",
                     namespace="test",
                     container="worker",
-                    command=["sh", "-c", "pkill -KILL -f '[s]glang::'"],
+                    command=["sh", "-c", "pkill -STOP -f '[s]glang::'"],
                     stdin=False,
                     stdout=True,
                     stderr=True,

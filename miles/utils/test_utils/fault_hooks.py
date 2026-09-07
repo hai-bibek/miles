@@ -53,7 +53,7 @@ class FaultHookOutcome(StrEnum):
     ERRORED = "errored"
 
 
-REMOTE_SUPPORTED_MODES = frozenset({FailureMode.SIGKILL})
+REMOTE_SUPPORTED_MODES = frozenset({FailureMode.SIGKILL, FailureMode.SIGSTOP})
 
 
 REMOTE_CAPABLE_HOOKS: frozenset[FaultHookName] = frozenset(

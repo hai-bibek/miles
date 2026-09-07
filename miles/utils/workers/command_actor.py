@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import subprocess
 import threading
 
@@ -36,13 +37,16 @@ class CommandActor(NodeProbeMixin):
 
     def inject_fault(self, mode: str) -> None:
         assert self._process is not None, "CommandActor has no subprocess to inject a fault into"
-        assert (failure_mode := fault_injector.FailureMode(mode)) is fault_injector.FailureMode.SIGKILL, (
-            f"{failure_mode.value} is a fault a process inflicts on itself from the inside, and no signal reproduces "
-            f"it from the outside, so only sigkill can be injected into a subprocess"
-        )
+        failure_mode = fault_injector.FailureMode(mode)
+        signals = {
+            fault_injector.FailureMode.SIGKILL: signal.SIGKILL,
+            fault_injector.FailureMode.SIGSTOP: signal.SIGSTOP,
+        }
+        if failure_mode not in signals:
+            raise ValueError(f"Unsupported subprocess fault: {failure_mode.value}")
 
-        logger.warning(f"CommandActor kills its subprocess group pid={self._process.pid}")
-        process_utils.kill_process_tree(self._process)
+        logger.warning(f"CommandActor sends {failure_mode.value} to subprocess group pid={self._process.pid}")
+        os.killpg(self._process.pid, signals[failure_mode])
 
     def _babysit(self, process: subprocess.Popen) -> None:
         returncode = process.wait()

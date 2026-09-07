@@ -33,9 +33,14 @@ class _Capability:
         return self._operations
 
 
-def _execute(operations: _RecordingCellOperations, *, request_id: str = "req-1") -> FaultHookOutcome:
+def _execute(
+    operations: _RecordingCellOperations,
+    *,
+    request_id: str = "req-1",
+    mode: FailureMode = FailureMode.SIGKILL,
+) -> FaultHookOutcome:
     return CellOperationsRemoteFaultExecutor(capability=_Capability(operations))(
-        target=_TARGET, mode=FailureMode.SIGKILL, request_id=request_id
+        target=_TARGET, mode=mode, request_id=request_id
     )
 
 
@@ -51,6 +56,22 @@ class TestDeliveringARemoteFault:
             dict(
                 cell_id="engine-0",
                 mode=FailureMode.SIGKILL,
+                expected_workers_hash="hash-1",
+                sub_index=0,
+            )
+        ]
+
+    def test_a_sigstop_is_aimed_at_the_same_cell_as_a_kill(self):
+        """A stop targets the same cell worker as a kill."""
+        operations = _RecordingCellOperations(outcome=FaultInjectionOutcome.INJECTED)
+
+        outcome = _execute(operations, request_id="req-7", mode=FailureMode.SIGSTOP)
+
+        assert outcome is FaultHookOutcome.ACCEPTED
+        assert operations.calls == [
+            dict(
+                cell_id="engine-0",
+                mode=FailureMode.SIGSTOP,
                 expected_workers_hash="hash-1",
                 sub_index=0,
             )
