@@ -383,13 +383,19 @@ class TestUpdateWeights:
             debug_rollout_only=False,
             save_inference_engine_weight_checksum=True,
             start_rollout_id=start_rollout_id,
+            update_weights_interval=1,
+            lora_rank=0,
+            lora_adapter_path=None,
         )
 
     @staticmethod
     def _checksum_controller():
         return MagicMock(
             start_update_weights=AsyncMock(
-                return_value=SimpleNamespace(snapshot_cell_id_to_hashes={"cell-0": "hash-0", "cell-1": "hash-1"})
+                return_value=SimpleNamespace(
+                    engine_cell_ids=["cell-0", "cell-1"],
+                    snapshot_cell_id_to_hashes={"cell-0": "hash-0", "cell-1": "hash-1"},
+                )
             ),
             end_update_weights=AsyncMock(),
             snapshot_weight_checksums=AsyncMock(),
@@ -502,19 +508,90 @@ class TestUpdateWeights:
         assert logged == []
         inference_controller.snapshot_weight_checksums.assert_not_awaited()
 
-    async def test_a_publication_whose_targets_all_left_records_no_checksum_event(self, monkeypatch):
-        """An empty audit read no engine at all, and recording one would pass as evidence it was served."""
+    async def test_a_publication_whose_targets_all_left_is_retried_before_advancing_rollout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A retired publication cannot advance rollout until a replacement has taken the weights."""
         from miles.ray.placement_group import update_weights
 
         actor_model, rollout_executor = self._fakes(weight_version=7)
         inference_controller = self._checksum_controller()
-        inference_controller.snapshot_weight_checksums = AsyncMock(return_value={})
+        inference_controller.snapshot_weight_checksums = AsyncMock(side_effect=[{}, {"cell-0": {"w": "hash"}}])
         logged = self._record_checksum_events(monkeypatch)
 
         await update_weights(self._checksum_args(), actor_model, rollout_executor, inference_controller)
 
-        assert logged == []
+        assert len(logged) == 1
+        assert actor_model.update_weights.await_count == 2
+        assert inference_controller.snapshot_weight_checksums.await_count == 2
         rollout_executor.set_weight_version.assert_awaited_once_with(7, trainer_model_id=None)
+
+    async def test_all_failed_targets_use_the_replacement_snapshot_when_retrying(self) -> None:
+        """A retry must send weights to the replacement incarnation instead of its failed predecessor."""
+        actor_model, rollout_executor = self._fakes(weight_version=7)
+        failed = WeightUpdateReport(weight_version=None, updated_cell_ids=(), failed_cell_ids=("cell-0",))
+        actor_model.update_weights.side_effect = [failed, actor_model.update_weights.return_value]
+        snapshots = [
+            SimpleNamespace(engine_cell_ids=["cell-0"], snapshot_cell_id_to_hashes={"cell-0": "old"}),
+            SimpleNamespace(engine_cell_ids=["cell-0"], snapshot_cell_id_to_hashes={"cell-0": "new"}),
+        ]
+        controller = MagicMock(start_update_weights=AsyncMock(side_effect=snapshots), end_update_weights=AsyncMock())
+
+        await placement_group_module.update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        assert [call.kwargs["info"] for call in actor_model.update_weights.await_args_list] == snapshots
+        assert [call.kwargs["failed_cell_ids"] for call in controller.end_update_weights.await_args_list] == [
+            ["cell-0"],
+            [],
+        ]
+        rollout_executor.set_weight_version.assert_awaited_once_with(7, trainer_model_id=None)
+
+    @pytest.mark.parametrize("failure", ["transfer", "audit"])
+    async def test_repeated_total_loss_fails_without_starting_rollout(
+        self, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        """Repeatedly losing every target must terminate instead of handing an empty fleet to rollout."""
+        actor_model, rollout_executor = self._fakes(weight_version=7)
+        controller = self._checksum_controller()
+        controller.snapshot_weight_checksums.return_value = {}
+        logged = self._record_checksum_events(monkeypatch)
+        if failure == "transfer":
+            actor_model.update_weights.return_value = WeightUpdateReport(
+                weight_version=None, updated_cell_ids=(), failed_cell_ids=("cell-0",)
+            )
+
+        with pytest.raises(RuntimeError, match="No inference cell retained the weights after 3 publication attempts"):
+            await placement_group_module.update_weights(
+                self._checksum_args(), actor_model, rollout_executor, controller
+            )
+
+        assert actor_model.update_weights.await_count == 3
+        assert controller.end_update_weights.await_count == 3
+        assert logged == []
+        rollout_executor.set_weight_version.assert_not_awaited()
+
+    async def test_replacement_wait_failure_does_not_advance_rollout(self) -> None:
+        """An exhausted replacement wait must stop before publishing a version or starting another transfer."""
+        actor_model, rollout_executor = self._fakes(weight_version=None)
+        actor_model.update_weights.return_value = WeightUpdateReport(
+            weight_version=None, updated_cell_ids=(), failed_cell_ids=("cell-0",)
+        )
+        controller = MagicMock(
+            start_update_weights=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(engine_cell_ids=["cell-0"], snapshot_cell_id_to_hashes={"cell-0": "old"}),
+                    TimeoutError("No inference cell became ready"),
+                ]
+            ),
+            end_update_weights=AsyncMock(),
+        )
+
+        with pytest.raises(TimeoutError, match="No inference cell became ready"):
+            await placement_group_module.update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        controller.end_update_weights.assert_awaited_once()
+        actor_model.update_weights.assert_awaited_once()
+        rollout_executor.set_weight_version.assert_not_awaited()
 
     async def test_a_failed_update_closes_the_window_without_marking_anything_ready(self):
         """A trainer that raised leaves the controller lock held, wedging every later rollout call."""

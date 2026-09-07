@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+from argparse import Namespace
 from typing import NamedTuple
 
 import ray
@@ -38,12 +39,15 @@ from miles.utils.hot_restart import (
     wait_trainers_idle,
     wait_until_worker_not_initialized,
 )
+from miles.utils.lora import is_lora_enabled
 from miles.utils.test_utils.ft_test_actions import FTTestActionOrchestrationExecutor
 from miles.utils.workers.types import DeployComponent, DeploymentIdentity
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.static import wait_static_addrs_ready
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_PUBLICATION_MAX_ATTEMPTS = 3
 
 
 @ray.remote(num_gpus=1)
@@ -303,29 +307,42 @@ async def update_weights(
     if rollout_id is not None:
         await orchestration_executor.run_after_step(rollout_id=rollout_id)
 
-    info: UpdatableEngines = await inference_controller.start_update_weights(model_id=trainer_model_id)
-    try:
-        report: WeightUpdateReport = await actor_model.update_weights(info=info, rollout_id=rollout_id)
-    except BaseException:
-        await _abort_update_window(inference_controller, snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
-        raise
-    await inference_controller.end_update_weights(
-        snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
-        updated_cell_ids=list(report.updated_cell_ids),
-        failed_cell_ids=list(report.failed_cell_ids),
-    )
+    for attempt in range(_WEIGHT_PUBLICATION_MAX_ATTEMPTS):
+        info: UpdatableEngines = await inference_controller.start_update_weights(model_id=trainer_model_id)
+        try:
+            report: WeightUpdateReport = await actor_model.update_weights(info=info, rollout_id=rollout_id)
+        except BaseException:
+            await _abort_update_window(
+                inference_controller, snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes
+            )
+            raise
+        await inference_controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+            updated_cell_ids=list(report.updated_cell_ids),
+            failed_cell_ids=list(report.failed_cell_ids),
+        )
 
-    await _maybe_log_inference_engine_weight_checksums(
-        args,
-        inference_controller=inference_controller,
-        rollout_id=rollout_id,
-        trainer_model_id=trainer_model_id,
-        report=report,
-        snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
-    )
+        if (
+            report.updated_cell_ids or not report.failed_cell_ids
+        ) and await _maybe_log_inference_engine_weight_checksums(
+            args,
+            inference_controller=inference_controller,
+            rollout_id=rollout_id,
+            trainer_model_id=trainer_model_id,
+            report=report,
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+        ):
+            if report.weight_version is not None:
+                await rollout_executor.set_weight_version(report.weight_version, trainer_model_id=trainer_model_id)
+            return
 
-    if report.weight_version is not None:
-        await rollout_executor.set_weight_version(report.weight_version, trainer_model_id=trainer_model_id)
+        logger.warning(
+            f"Weight publication attempt {attempt + 1} left no serving target for model {trainer_model_id!r}"
+        )
+
+    raise RuntimeError(
+        f"No inference cell retained the weights after {_WEIGHT_PUBLICATION_MAX_ATTEMPTS} publication attempts"
+    )
 
 
 async def _abort_update_window(
@@ -345,15 +362,15 @@ async def _maybe_log_inference_engine_weight_checksums(
     trainer_model_id: str | None,
     report: WeightUpdateReport,
     snapshot_cell_id_to_hashes: dict[str, str],
-) -> None:
+) -> bool:
     if not args.save_inference_engine_weight_checksum:
-        return
+        return True
     if not is_event_logger_initialized():
-        return
+        return True
     if args.debug_train_only or args.debug_rollout_only:
-        return
+        return True
     if (weight_version := report.weight_version) is None:
-        return
+        return True
 
     snapshot = await inference_controller.snapshot_weight_checksums(
         expected_weight_version=weight_version,
@@ -368,7 +385,7 @@ async def _maybe_log_inference_engine_weight_checksums(
             f"confirmed gone, so no checksum event is written: an empty audit is no evidence that the publication "
             f"was ever served"
         )
-        return
+        return False
 
     engine_checksums = flatten_inference_engine_checksums(snapshot)
     get_event_logger().log(
@@ -378,8 +395,14 @@ async def _maybe_log_inference_engine_weight_checksums(
             weight_version=weight_version,
             trainer_model_id=trainer_model_id,
             engine_checksums=engine_checksums,
+            adjacent_weight_change_expected=_compute_adjacent_weight_change_expected(args),
         ),
     )
+    return True
+
+
+def _compute_adjacent_weight_change_expected(args: Namespace) -> bool:
+    return args.update_weights_interval == 1 and not is_lora_enabled(args)
 
 
 # TODO: move (when reorganizing files)

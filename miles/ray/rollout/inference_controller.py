@@ -225,7 +225,14 @@ class InferenceController:
                 snapshot_cell_id_to_hashes={},
             )
 
-        cells = srv.engine_cells
+        deadline = time.monotonic() + CELLS_READY_TIMEOUT_SECONDS
+        while not (cells := srv.engine_cells):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"No inference cell became ready for model {srv.model_name!r}'s weight update")
+            async with self.context_lock.with_released():
+                await asyncio.sleep(CELLS_READY_POLL_INTERVAL_SECONDS)
+            await self._ensure_cells_ready(model_id=model_id)
+
         return UpdatableEngines(
             rollout_engines=[cell.api_client for cell in cells],
             engine_gpu_counts=[cell.meta.num_gpus_per_engine for cell in cells],

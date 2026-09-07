@@ -573,6 +573,7 @@ class TestPerModelHealthCheckerActiveness:
         """The other policy keeps serving through this window, and an unprobed engine is not healed."""
         controller, servers = self._controller("solver", "verifier")
         servers["solver"].update_weights = True
+        servers["solver"].server_cells["solver-0"] = _FakeUpdatableCell("solver-hash", cell_id="solver-0")
         before = servers["verifier"].health_checker_activeness.get()
 
         await controller.start_update_weights(model_id="solver")
@@ -598,6 +599,7 @@ class TestPerModelHealthCheckerActiveness:
         """Its last round ends with a weight update, and no later rollout of its own would ever un-pause it."""
         controller, servers = self._controller("solver", "verifier")
         servers["solver"].update_weights = True
+        servers["solver"].server_cells["solver-0"] = _FakeUpdatableCell("solver-hash", cell_id="solver-0")
         await controller.start_update_weights(model_id="solver")
         await controller.end_update_weights({}, updated_cell_ids=[], failed_cell_ids=[])
 
@@ -834,9 +836,9 @@ class TestUpdatableModelSelection:
         """A frozen reference model handed the trainer's weights stops being the baseline the
         KL term is measured against."""
         actor = _RecordingServer(model_name="actor", update_weights=True)
-        actor.api_clients = ["actor-client"]
+        actor.server_cells["actor-0"] = _FakeUpdatableCell("actor-hash", cell_id="actor-0", api_client="actor-client")
         ref = _RecordingServer(model_name="ref", update_weights=False)
-        ref.api_clients = ["ref-client"]
+        ref.server_cells["ref-0"] = _FakeUpdatableCell("ref-hash", cell_id="ref-0", api_client="ref-client")
 
         updatable = await self._controller(actor, ref).start_update_weights()
 
@@ -913,9 +915,9 @@ class TestGetServersOfModelId:
     async def test_a_named_policy_scopes_the_update_to_its_own_server(self):
         """Several policies train at once, so the ambiguity a single-policy run never hits is the normal case."""
         alpha = _RecordingServer(model_name="alpha", update_weights=True)
-        alpha.api_clients = ["alpha-client"]
+        alpha.server_cells["alpha-0"] = _FakeUpdatableCell("alpha-hash", cell_id="alpha-0", api_client="alpha-client")
         beta = _RecordingServer(model_name="beta", update_weights=True)
-        beta.api_clients = ["beta-client"]
+        beta.server_cells["beta-0"] = _FakeUpdatableCell("beta-hash", cell_id="beta-0", api_client="beta-client")
 
         updatable = await self._controller(alpha, beta).start_update_weights(model_id="beta")
 
@@ -954,6 +956,55 @@ class TestGetServersOfModelId:
 
 
 class TestEnsureCellsReady:
+    @pytest.mark.parametrize("has_errored_cell", [False, True])
+    async def test_an_empty_updatable_fleet_waits_without_blocking_its_replacement(
+        self, monkeypatch: pytest.MonkeyPatch, has_errored_cell: bool
+    ) -> None:
+        """A replacement can acquire the controller lock and receive weights before rollout resumes."""
+        controller = _make_controller({})
+        server = RolloutServer(
+            server_cells={},
+            args=make_args(),
+            context_lock=controller.context_lock,
+            engine_provider=_FakeWorkerProvider([]),
+            model_name="actor",
+            update_weights=True,
+        )
+        controller.servers = {"actor": server}
+        if has_errored_cell:
+            failed = _FakeUpdatableCell("old")
+            failed.is_errored = True
+            failed.is_pending_weights_or_serving = False
+            server.server_cells["failed"] = failed
+
+        async def register_replacement(delay: float) -> None:
+            async with controller.context_lock:
+                server.server_cells["replacement"] = _FakeUpdatableCell("new", cell_id="replacement")
+
+        monkeypatch.setattr(inference_controller_module.asyncio, "sleep", register_replacement)
+
+        info = await controller.start_update_weights()
+        await controller.end_update_weights(
+            info.snapshot_cell_id_to_hashes, updated_cell_ids=info.engine_cell_ids, failed_cell_ids=[]
+        )
+
+        assert info.snapshot_cell_id_to_hashes == {"replacement": "new"}
+        assert server.server_cells["replacement"].marked_ready == 1
+
+    async def test_an_empty_updatable_fleet_times_out_and_releases_the_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fleet that never reappears cannot return a successful empty update or strand the controller lock."""
+        controller = _make_controller({"actor": _RecordingServer(model_name="actor", update_weights=True)})
+        monkeypatch.setattr(inference_controller_module, "CELLS_READY_TIMEOUT_SECONDS", 0)
+
+        with pytest.raises(TimeoutError, match="No inference cell became ready"):
+            await controller.start_update_weights()
+
+        async with asyncio.timeout(1):
+            async with controller.context_lock:
+                pass
+
     @staticmethod
     def _controller() -> InferenceController:
         """One policy is serving, the other still has a cell coming up."""
@@ -1670,24 +1721,11 @@ class TestCellsReadyIsScopedToTheTargetedModel:
     async def test_a_named_model_does_not_wait_for_another_models_cells(self):
         """Different model ids are independent, so a sick engine of B must not stall A's weight update."""
         a = _RecordingServer(model_name="a", update_weights=True)
-        a.api_clients = ["a-client"]
-        a.server_cells = {
-            "a-0": SimpleNamespace(
-                is_pending_weights_or_serving=True,
-                is_uninitialized=False,
-                is_errored=False,
-                meta=SimpleNamespace(workers_hash="hash-a"),
-            )
-        }
+        a.server_cells = {"a-0": _FakeUpdatableCell("hash-a", cell_id="a-0", api_client="a-client")}
         b = _RecordingServer(model_name="b", update_weights=True)
-        b.server_cells = {
-            "b-0": SimpleNamespace(
-                is_pending_weights_or_serving=False,
-                is_uninitialized=False,
-                is_errored=False,
-                meta=SimpleNamespace(workers_hash="hash-b"),
-            )
-        }
+        pending = _FakeUpdatableCell("hash-b", cell_id="b-0")
+        pending.is_pending_weights_or_serving = False
+        b.server_cells = {"b-0": pending}
         controller = _make_controller({"a": a, "b": b})
 
         updatable = await controller.start_update_weights(model_id="a")
