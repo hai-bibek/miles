@@ -20,6 +20,7 @@ class ModelCompanion(torch.nn.Module):
         self.pipeline_rank = pipeline_rank
         self.chunk_index = chunk_index
         self.replica_id = replica_id
+        self.register_buffer("weight_version", torch.zeros((), dtype=torch.int64, device="cpu"))
         self.register_buffer("trained_rows", torch.empty((0, 4), dtype=torch.int64, device="cpu"))
         self.register_buffer("skipped_nonfinite_rows", torch.empty((0, 4), dtype=torch.int64, device="cpu"))
 
@@ -70,7 +71,11 @@ class ModelCompanion(torch.nn.Module):
     ) -> None:
         for name, buffer in self.named_buffers():
             incoming = state_dict[f"{prefix}{name}"]
-            assert incoming.dtype == torch.int64 and incoming.ndim == 2 and incoming.shape[1] == 4
+            assert incoming.dtype == torch.int64
+            if name == "weight_version":
+                assert incoming.ndim == 0 and incoming.item() >= 0
+            else:
+                assert incoming.ndim == 2 and incoming.shape[1] == 4
             buffer.resize_(incoming.shape)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -91,6 +96,26 @@ class ModelCompanionUtils:
                 replica_id=(parallel.tp.rank, parallel.cp.rank, parallel.intra_dp.rank),
             ),
         )
+
+    @staticmethod
+    def weight_version(model: Sequence[torch.nn.Module]) -> int:
+        companions = _model_companions(model)
+        assert companions, "Model is missing its companion"
+        return ModelCompanionUtils.version_from_buffers(ModelCompanionUtils.named_buffers(model))
+
+    @staticmethod
+    def version_from_buffers(buffers: Iterable[tuple[str, torch.Tensor]]) -> int:
+        versions = {int(buffer.item()) for name, buffer in buffers if name.endswith(".weight_version")}
+        assert len(versions) == 1, f"Model companion versions diverged: {versions}"
+        return versions.pop()
+
+    @staticmethod
+    def bump_weight_version(model: Sequence[torch.nn.Module]) -> None:
+        companions = _model_companions(model)
+        if companions:
+            ModelCompanionUtils.weight_version(model)
+        for companion in companions:
+            companion.weight_version.add_(1)
 
     @staticmethod
     def record(model: Sequence[torch.nn.Module], samples: Iterable[TrainingSampleIdentity]) -> None:
@@ -115,6 +140,7 @@ class ModelCompanionUtils:
     @staticmethod
     def clear(model: Sequence[torch.nn.Module]) -> None:
         for companion in _model_companions(model):
+            companion.weight_version.zero_()
             companion.trained_rows.resize_((0, 4))
             companion.skipped_nonfinite_rows.resize_((0, 4))
 

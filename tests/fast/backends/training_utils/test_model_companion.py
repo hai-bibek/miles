@@ -95,7 +95,9 @@ class TestModelCompanion:
         witness = ModelCompanion()
 
         with pytest.raises(KeyError, match="skipped_nonfinite_rows"):
-            witness.load_state_dict({"trained_rows": torch.empty((0, 4), dtype=torch.int64)})
+            witness.load_state_dict(
+                {"weight_version": torch.tensor(0), "trained_rows": torch.empty((0, 4), dtype=torch.int64)}
+            )
 
     def test_model_chunks_receive_identical_updates(self) -> None:
         """Virtual pipeline chunks retain identical witness mirrors."""
@@ -119,3 +121,93 @@ class TestModelCompanion:
 
         with pytest.raises(AssertionError, match="chunks diverged"):
             ModelCompanionUtils.snapshot(chunks)
+
+
+class TestModelWeightVersion:
+    def test_successful_steps_advance_all_chunks_without_witness_rows(self) -> None:
+        """Version progress does not depend on whether samples are recorded."""
+        chunks = [ModelCompanion(), ModelCompanion()]
+        assert ModelCompanionUtils.weight_version(chunks) == 0
+
+        ModelCompanionUtils.bump_weight_version(chunks)
+        ModelCompanionUtils.bump_weight_version(chunks)
+
+        assert ModelCompanionUtils.weight_version(chunks) == 2
+        assert all(chunk.snapshot() == {} for chunk in chunks)
+
+    def test_checkpoint_restores_version_and_witness_as_one_state(self) -> None:
+        """Loading older weights also rewinds their version and witness."""
+        source = ModelCompanion()
+        ModelCompanionUtils.bump_weight_version([source])
+        source.record([_identity(7, 0, 1)])
+        target = ModelCompanion()
+        target.weight_version.fill_(90)
+        target.record([_identity(8, 0, 1)])
+
+        target.load_state_dict(source.state_dict())
+
+        assert ModelCompanionUtils.weight_version([target]) == 1
+        assert target.snapshot() == {_identity(7, 0, 1): 1}
+
+    def test_version_is_a_cpu_tensor_preserved_by_model_transforms(self) -> None:
+        """Device and dtype transforms leave the model version intact on CPU."""
+        companion = ModelCompanion()
+        original = companion.weight_version
+        ModelCompanionUtils.bump_weight_version([companion])
+        companion.to(device="meta", dtype=torch.float16)
+
+        assert companion.weight_version is original
+        assert original.device.type == "cpu"
+        assert original.dtype == torch.int64
+        assert original.item() == 1
+
+    def test_clear_resets_version_with_both_witness_outcomes(self) -> None:
+        """Loading fresh pretrained weights resets all companion state."""
+        companion = ModelCompanion()
+        companion.weight_version.fill_(3)
+        companion.record([_identity(7, 0, 1)])
+        companion.record_skipped_nonfinite([_identity(8, 0, 1)])
+
+        ModelCompanionUtils.clear([companion])
+
+        assert ModelCompanionUtils.weight_version([companion]) == 0
+        assert companion.snapshot() == companion.snapshot_skipped_nonfinite() == {}
+
+    def test_divergent_chunks_fail_before_any_version_changes(self) -> None:
+        """A version mismatch cannot be hidden by advancing every chunk."""
+        chunks = [ModelCompanion(), ModelCompanion()]
+        chunks[1].weight_version.fill_(2)
+
+        with pytest.raises(AssertionError, match="versions diverged"):
+            ModelCompanionUtils.bump_weight_version(chunks)
+
+        assert [chunk.weight_version.item() for chunk in chunks] == [0, 2]
+
+    @pytest.mark.parametrize("value", [torch.tensor(-1), torch.tensor([1]), torch.tensor(1.0)])
+    def test_invalid_checkpoint_version_is_rejected(self, value: torch.Tensor) -> None:
+        """Checkpoint versions must be nonnegative scalar int64 values."""
+        companion = ModelCompanion()
+        state = companion.state_dict()
+        state["weight_version"] = value
+
+        with pytest.raises(AssertionError):
+            companion.load_state_dict(state)
+
+    def test_tensor_backuper_restores_version_with_actor_weights(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Temporary model swaps restore the actor version and witness together."""
+        from miles.utils.tensor_backper import TensorBackuper
+
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        companion = ModelCompanion()
+        companion.weight_version.fill_(7)
+        companion.record([_identity(3, 0, 1)])
+        backuper = TensorBackuper.create(lambda: ModelCompanionUtils.named_buffers([companion]))
+        backuper.backup("actor")
+        companion.weight_version.fill_(2)
+        companion.record([_identity(5, 0, 1)])
+
+        assert ModelCompanionUtils.version_from_buffers(backuper.get("actor").items()) == 7
+        backuper.restore("actor")
+
+        assert companion.weight_version.item() == 7
+        assert companion.snapshot() == {_identity(3, 0, 1): 1}

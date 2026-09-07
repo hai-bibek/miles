@@ -129,6 +129,7 @@ class TestDeserializeFromTransport:
         skipped_sample = TrainingSampleIdentity(source_sample_index=8, row_index=0, row_count=1)
         donor.record([sample])
         donor.record_skipped_nonfinite([skipped_sample])
+        donor.weight_version.fill_(17)
         state_dict, _ = MCoreTensorAwareStateDict.from_state_dict(
             {"model": donor.sharded_state_dict(prefix="model_companion.")},
             algo="atomic",
@@ -148,11 +149,13 @@ class TestDeserializeFromTransport:
         )
         receiver.load_state_dict(
             {
+                "weight_version": receiver_state["model"]["model_companion.weight_version"],
                 "trained_rows": receiver_state["model"]["model_companion.trained_rows"],
                 "skipped_nonfinite_rows": receiver_state["model"]["model_companion.skipped_nonfinite_rows"],
             }
         )
 
+        assert receiver.weight_version.item() == 17
         assert receiver.snapshot() == {sample: 1}
         assert receiver.snapshot_skipped_nonfinite() == {skipped_sample: 1}
 
