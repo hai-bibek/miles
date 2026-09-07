@@ -4,6 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 from tests.e2e.ft.conftest_ft import hook_injection, scenario_weight_update_p2p_remote
+from tests.e2e.ft.conftest_ft.fault_injection.recovery_source import (
+    CHECKPOINT_TRACKER_FILENAME,
+    read_checkpoint_iteration,
+)
 from tests.e2e.ft.conftest_ft.fault_injection.state import CellInfo, EventLog, ObservationsEvent
 from tests.fast.e2e.ft.fault_injection.utils import RUNNING_NOT_SERVING, SERVING, cell, staged
 
@@ -261,7 +265,7 @@ class TestRecoverySourceGate:
     def test_a_checkpoint_tracker_that_names_no_iteration_is_not_a_recovery_source(self, tmp_path: Path):
         """An empty or non-numeric tracker is written before the checkpoint is usable, and a fault then lands early."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("release\n")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("release\n")
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
@@ -275,14 +279,14 @@ class TestRecoverySourceGate:
     def test_an_iteration_zero_tracker_is_not_a_recovery_source(self, tmp_path: Path):
         """Iteration zero is the tracker a run writes before any step of its own has been saved."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("0")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("0")
 
-        assert hook_injection.read_checkpoint_iteration(tmp_path / "ckpt") is None
+        assert read_checkpoint_iteration(tmp_path / "ckpt") is None
 
     def test_an_initial_publication_alone_is_not_a_recovery_source(self, tmp_path: Path):
         """The out-of-loop startup sync stamps rollout -1, so arming on it injects into the very first update."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("1")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("1")
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
@@ -296,7 +300,7 @@ class TestRecoverySourceGate:
     def test_an_empty_publication_is_not_a_recovery_source(self, tmp_path: Path):
         """A checksum event carrying no engine, or only empty dicts, proves no weights ever reached an engine."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("1")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("1")
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
@@ -310,7 +314,7 @@ class TestRecoverySourceGate:
     def test_a_run_that_completed_no_training_step_is_not_a_recovery_source(self, tmp_path: Path):
         """A discarded or errored step leaves the checkpoint describing nothing this run actually trained."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("1")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("1")
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
@@ -327,7 +331,7 @@ class TestRecoverySourceGate:
     def test_a_completed_step_a_checkpoint_and_a_real_publication_open_the_gate(self, tmp_path: Path):
         """All three exist, so a crashed cell has state to be healed from and the fault may land."""
         (tmp_path / "ckpt").mkdir()
-        (tmp_path / "ckpt" / hook_injection.CHECKPOINT_TRACKER_FILENAME).write_text("1")
+        (tmp_path / "ckpt" / CHECKPOINT_TRACKER_FILENAME).write_text("1")
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
@@ -896,7 +900,7 @@ class TestScenarioRecipe:
 
     def test_a_remote_request_expects_an_acceptance_and_a_local_one_a_fire(self):
         """The two actions are delivered by different processes and record different evidence of delivery."""
-        assert hook_injection._EXPECTED_OUTCOME_OF_TARGET == {
+        assert hook_injection.EXPECTED_OUTCOME_OF_TARGET == {
             FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
             FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
         }

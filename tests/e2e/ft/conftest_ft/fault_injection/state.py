@@ -13,6 +13,10 @@ def cell_is_alive(cell: dict) -> bool:
     return any(cond["type"] == "Healthy" and cond["status"] == "True" for cond in cell["status"]["conditions"])
 
 
+def cell_is_allocated(cell: dict) -> bool:
+    return any(cond["type"] == "Allocated" and cond["status"] == "True" for cond in cell["status"]["conditions"])
+
+
 class ObservedCellState(enum.Enum):
     SUSPENDED = "Suspended"  # torn down, holding no gpu
     PENDING = "Pending"  # allocated but gated: no engine serving yet
@@ -54,7 +58,42 @@ class ObservationsEvent(BaseEvent):
     cell_infos: dict[str, CellInfo]
 
 
-Event = InjectionEvent | ObservationsEvent
+class HookArmEvent(BaseEvent):
+    request_id: str
+    form_name: str
+    cell_type: str
+    source_cell_name: str
+    source_workers_hash: str
+    source_cell_index: int
+    source_rank_within_cell: int
+    hook: str
+    mode: str
+    target: str
+    acknowledged: bool
+
+
+class HookArmRefusedEvent(BaseEvent):
+    request_id: str
+    refused_because: str
+
+
+class HookFireEvent(BaseEvent):
+    request_id: str
+    hook: str
+    mode: str
+    target: str
+    outcome: str
+    weight_version: int | None
+    source_cell_index: int | None
+    source_rank_within_cell: int | None
+    victim_cell_name: str | None
+    victim_workers_hash: str | None
+    delivered: bool
+    rejected_because: str | None
+    harmless_because: str | None
+
+
+Event = InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent
 
 
 class EventLog:
@@ -71,6 +110,43 @@ class EventLog:
 
     def note_injection_attempt(self, *, cell_name: str, form_name: str, succeeded: bool, harmed: bool = True) -> None:
         self._append(InjectionEvent(cell_name=cell_name, form_name=form_name, succeeded=succeeded, harmed=harmed))
+
+    def note_hook_arm(
+        self,
+        *,
+        request_id: str,
+        form_name: str,
+        cell_type: str,
+        source_cell_name: str,
+        source_workers_hash: str,
+        source_cell_index: int,
+        source_rank_within_cell: int,
+        hook: str,
+        mode: str,
+        target: str,
+        acknowledged: bool,
+    ) -> None:
+        self._append(
+            HookArmEvent(
+                request_id=request_id,
+                form_name=form_name,
+                cell_type=cell_type,
+                source_cell_name=source_cell_name,
+                source_workers_hash=source_workers_hash,
+                source_cell_index=source_cell_index,
+                source_rank_within_cell=source_rank_within_cell,
+                hook=hook,
+                mode=mode,
+                target=target,
+                acknowledged=acknowledged,
+            )
+        )
+
+    def note_hook_arm_refusal(self, *, request_id: str, refused_because: str) -> None:
+        self._append(HookArmRefusedEvent(request_id=request_id, refused_because=refused_because))
+
+    def note_hook_fire(self, event: HookFireEvent) -> None:
+        self._append(event)
 
     def observe(self, cells: list[dict]) -> None:
         self._append(

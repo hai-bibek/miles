@@ -3,7 +3,7 @@ import random
 from collections.abc import Callable, Iterator
 from unittest.mock import MagicMock, patch
 
-from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, state
+from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, hook_forms, state
 
 from miles.utils.external_utils import command_utils
 from miles.utils.workers.types import ClusterBackend
@@ -22,7 +22,11 @@ def patched_requests() -> Iterator[MagicMock]:
     # the loop lists cells through core and injects through fault_forms, so a mock on core alone
     # leaves every injection reaching the real network and timing out against a host nobody serves
     mock_requests = MagicMock()
-    with patch.object(core, "requests", mock_requests), patch.object(fault_forms, "requests", mock_requests):
+    with (
+        patch.object(core, "requests", mock_requests),
+        patch.object(fault_forms, "requests", mock_requests),
+        patch.object(hook_forms, "requests", mock_requests),
+    ):
         yield mock_requests
 
 
@@ -40,7 +44,7 @@ def cell(
     workers_hash: str = "generation-0",
 ) -> dict:
     status = "True" if healthy else "False"
-    conditions = [{"type": "Healthy", "status": status}]
+    conditions = [{"type": "Healthy", "status": status}, {"type": "Allocated", "status": "True"}]
     if cell_type == "rollout":
         conditions.append({"type": "Serving", "status": "True" if serving else "False"})
     return {
@@ -85,6 +89,7 @@ def staged(
     conditions: list[dict] = (
         [
             {"type": "Healthy", "status": "True"},
+            {"type": "Allocated", "status": "True"},
             {"type": "Serving", "status": "True" if cell_state is SERVING else "False"},
         ]
         if phase == "Running"
@@ -110,8 +115,10 @@ def log_of(
     return log
 
 
-def typed_cell(name: str, cell_type: str, *, healthy: bool = True, serving: bool = True) -> dict:
-    return cell(name, healthy=healthy, cell_type=cell_type, serving=serving)
+def typed_cell(
+    name: str, cell_type: str, *, healthy: bool = True, serving: bool = True, workers_hash: str = "generation-0"
+) -> dict:
+    return cell(name, healthy=healthy, cell_type=cell_type, serving=serving, workers_hash=workers_hash)
 
 
 def config_of(backend: ClusterBackend, *, namespace: str = NAMESPACE) -> command_utils.ExecuteTrainConfig:
@@ -123,13 +130,29 @@ def api_server_fault_forms() -> fault_forms.CellFaultForms:
 
 
 class StubFaultForm(fault_forms.BaseFaultForm):
-    def __init__(self, form_name: str, on_inject: Callable[[dict, random.Random], None]) -> None:
+    def __init__(
+        self,
+        form_name: str,
+        on_inject: Callable[[dict, random.Random], None],
+        *,
+        available: bool = True,
+        records_own_attempt: bool = False,
+    ) -> None:
         self._name = form_name
         self._on_inject = on_inject
+        self._available = available
+        self._records_own_attempt = records_own_attempt
 
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def records_own_attempt(self) -> bool:
+        return self._records_own_attempt
+
+    def is_available(self, cell: dict) -> bool:
+        return self._available
 
     def inject(self, cell: dict, rng: random.Random) -> None:
         self._on_inject(cell, rng)
