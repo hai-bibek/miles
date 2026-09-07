@@ -56,6 +56,14 @@ def cell(
     }
 
 
+def paused_cell(name: str, *, cell_type: str = "rollout", workers_hash: str = "generation-0") -> dict:
+    built = cell(name, healthy=False, cell_type=cell_type, workers_hash=workers_hash)
+    for condition in built["status"]["conditions"]:
+        if condition["type"] == "Healthy":
+            condition["status"] = "Unknown"
+    return built
+
+
 def names(cells: list[dict]) -> set[str]:
     return {c["metadata"]["name"] for c in cells}
 

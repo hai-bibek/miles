@@ -50,6 +50,7 @@ class CellInfo(FrozenStrictBaseModel):
     cell_type: str
     state: ObservedCellState
     alive: bool
+    health_status: str | None = None
     workers_hash: str | None = None
 
 
@@ -79,7 +80,10 @@ class HookArmRefusedEvent(BaseEvent):
 
 
 class HookFireEvent(BaseEvent):
+    fired_at: datetime
     request_id: str
+    trainer_model_id: str | None
+    assigned_cell_ids: list[str]
     hook: str
     mode: str
     target: str
@@ -95,7 +99,16 @@ class HookFireEvent(BaseEvent):
     harmless_because: str | None
 
 
-Event = InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent
+class WeightPublicationEvent(BaseEvent):
+    published_at: datetime
+    trainer_model_id: str | None
+    weight_version: int
+    cell_ids: list[str]
+
+
+Event = (
+    InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent | WeightPublicationEvent
+)
 
 
 class EventLog:
@@ -152,6 +165,9 @@ class EventLog:
     def note_hook_fire(self, event: HookFireEvent) -> None:
         self._append(event)
 
+    def note_weight_publication(self, event: WeightPublicationEvent) -> None:
+        self._append(event)
+
     def observe(self, cells: list[dict]) -> None:
         self._append(
             ObservationsEvent(
@@ -160,6 +176,14 @@ class EventLog:
                         cell_type=cell_type_of(cell),
                         state=compute_observed_cell_state(cell),
                         alive=cell_is_alive(cell),
+                        health_status=next(
+                            (
+                                condition["status"]
+                                for condition in cell["status"]["conditions"]
+                                if condition["type"] == "Healthy"
+                            ),
+                            None,
+                        ),
                         workers_hash=cell["status"].get("workers_hash"),
                     )
                     for cell in cells

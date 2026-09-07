@@ -501,7 +501,9 @@ p2p_remote: arms weight_update.after_p2p_submit with sigkill, target remote_infe
              wrote to, the victim named by the fire is one of that assignment's engines at
              the incarnation it held when the hook was armed, that incarnation gone within 600s
              of the fire and by the end, the victim Serving again under a replacement,
-             every sibling target and the sender retaining their incarnation and returning to service, an engine
+             every sibling target and the sender retaining their incarnation, returning to service,
+             their latest known health still in service (Unknown does not clear a failure),
+             rollout siblings still Serving at the final observation, an engine
              outside the assignment still serving its original incarnation, and a non-empty
              publication after that assignment
 ```

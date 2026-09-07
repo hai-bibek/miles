@@ -114,6 +114,9 @@ def run_fault_injection_loop(
             )
         logger.info("Injected fault %s into %s", form.name, cell_name)
 
+    if collect_hook_fires is not None:
+        collect_hook_fires()
+
 
 def _raise_if_an_unknown_injection_is_stuck(pending: list[PendingInjection], *, timeout_seconds: float) -> None:
     now = datetime.now(timezone.utc)
