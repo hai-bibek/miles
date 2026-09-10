@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import shutil
+from collections.abc import Iterator
 from contextlib import ExitStack, nullcontext
 
 import torch
@@ -13,6 +14,7 @@ from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutput
 from miles.backends.megatron_utils.rematerialize_utils import build_main_cast_context
+from miles.backends.training_utils.model_companion import ModelCompanionUtils
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
@@ -229,7 +231,7 @@ class MegatronTrainRayActor(TrainRayActor):
             main_cast_ctx = build_main_cast_context(args, model=self.model, optimizer=self.optimizer)
 
         self.weights_backuper = TensorBackuper.create(
-            source_getter=self._named_actor_weights,
+            source_getter=self._named_actor_backup_tensors,
             main_cast_ctx=main_cast_ctx,
         )
         self._active_model_tag: str | None = "actor"
@@ -870,12 +872,20 @@ class MegatronTrainRayActor(TrainRayActor):
             translate_gpu_to_cpu=translate_gpu_to_cpu,
         )
 
+    def _named_actor_backup_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        yield from self._named_actor_weights()
+        yield from ModelCompanionUtils.named_buffers(self.model)
+
     def _get_actor_weights(self):
         if self._weight_sync_reads_tms_backup:
             return dict(self._named_actor_weights(translate_gpu_to_cpu=True))
         # use cpu backup only when weight is not live on gpu
         if self.args.colocate or self._active_model_tag != "actor":
-            return self.weights_backuper.get("actor")
+            return {
+                name: tensor
+                for name, tensor in self.weights_backuper.get("actor").items()
+                if not ModelCompanionUtils.is_buffer_name(name)
+            }
         return dict(self._named_actor_weights())
 
     @with_logs

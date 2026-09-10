@@ -1,8 +1,9 @@
 import logging
 import os
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Any
 
 import torch.distributed as dist
 from megatron.core.utils import unwrap_model
@@ -12,6 +13,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
+from miles.backends.training_utils.model_companion import ModelCompanionUtils
 from miles.utils import megatron_bridge_utils
 from miles_plugins.models.deepseek_v4.arguments import assert_checkpoint_is_current, is_dsv4_model
 
@@ -107,7 +109,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
     load_path = args.load
 
-    has_local_checkpoint_manager = "local_checkpoint_manager" in (checkpointing_context or {})
+    has_local_checkpoint_manager = _has_local_checkpoint(args, checkpointing_context)
     if has_local_checkpoint_manager:
         logger.info("Skipping disk path validation: using in-memory checkpoint via local_checkpoint_manager")
     else:
@@ -118,13 +120,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     if has_local_checkpoint_manager or _is_megatron_checkpoint(load_path):
         if not has_local_checkpoint_manager and is_dsv4_model(args):
             assert_checkpoint_is_current(load_path)
-        result = _load_checkpoint_megatron(
-            ddp_model=ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-        )
+        has_model_companion = has_local_checkpoint_manager or _has_model_companion_checkpoint(args)
+        if not has_model_companion and not skip_load_to_model_and_opt:
+            logger.warning("Checkpoint has no CPU training witness; starting with an empty witness")
+            ModelCompanionUtils.clear(ddp_model)
+        with nullcontext() if has_model_companion else ModelCompanionUtils.hide(ddp_model):
+            result = _load_checkpoint_megatron(
+                ddp_model=ddp_model,
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            )
     else:
         result = _load_checkpoint_hf(
             ddp_model=ddp_model,
@@ -155,6 +162,33 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                 )
 
     return result
+
+
+def _has_local_checkpoint(args: Any, checkpointing_context: dict[str, Any] | None) -> bool:
+    local_checkpoint_manager = (checkpointing_context or {}).get("local_checkpoint_manager")
+    if local_checkpoint_manager is None or args.non_persistent_ckpt_type != "local":
+        return False
+    local_iteration = local_checkpoint_manager.find_latest()
+    return local_iteration >= 0 and local_iteration >= _persistent_checkpoint_iteration(args)
+
+
+def _persistent_checkpoint_iteration(args: Any) -> int:
+    if args.ckpt_step:
+        return args.ckpt_step
+    tracker = Path(args.load) / "latest_checkpointed_iteration.txt"
+    if not tracker.is_file() or not tracker.read_text().strip().isdigit():
+        return -1
+    return int(tracker.read_text().strip())
+
+
+def _has_model_companion_checkpoint(args) -> bool:
+    path = Path(args.load)
+    if not re.fullmatch(r"iter_\d{7}", path.name):
+        iteration = _persistent_checkpoint_iteration(args)
+        if iteration < 0:
+            return False
+        path = path / f"iter_{iteration:07d}"
+    return (path / "model_companion.txt").is_file()
 
 
 def save_checkpoint_with_lora(iteration, model, optimizer, opt_param_scheduler):
@@ -204,8 +238,14 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     from megatron.bridge import AutoBridge
 
     logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
+    logger.warning("Pretrained checkpoint has no CPU training witness; starting with an empty witness")
+    ModelCompanionUtils.clear(ddp_model)
 
-    with megatron_bridge_utils.patch_megatron_model(ddp_model), _hide_critic_value_head_from_hf_load(ddp_model):
+    with (
+        megatron_bridge_utils.patch_megatron_model(ddp_model),
+        _hide_critic_value_head_from_hf_load(ddp_model),
+        ModelCompanionUtils.hide(ddp_model),
+    ):
         bridge = AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
         bridge.load_hf_weights(ddp_model)
 

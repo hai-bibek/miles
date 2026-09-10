@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Sequence
 import torch
 
 from miles.backends.megatron_utils.misc_utils import strip_param_name_prefix
+from miles.backends.training_utils.model_companion import ModelCompanionUtils
 from miles.utils.tensor_backper import MainCastContext
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ def _named_restore_extras(model: Sequence[torch.nn.Module]) -> Iterator[tuple[st
         for name, param in model_module.named_parameters():
             if param.dtype == torch.float32 or not param.requires_grad:
                 yield f"vp_stages.{vp_stage}.{strip_param_name_prefix(name)}", param
+    yield from ModelCompanionUtils.named_buffers(model)
 
 
 def build_main_cast_context(args: Namespace, *, model: Sequence[torch.nn.Module], optimizer) -> MainCastContext:
