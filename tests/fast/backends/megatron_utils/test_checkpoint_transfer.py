@@ -1,19 +1,33 @@
 import logging
 import pickle
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.tensor_aware_state_dict import MCoreTensorAwareStateDict
 from torch.utils._pytree import tree_flatten_with_path, tree_unflatten
 
 from miles.backends.megatron_utils.ft import checkpoint_transfer, in_memory_checkpoint
 from miles.backends.megatron_utils.ft.checkpoint_transfer import _TensorViewCodec, _TransportCodec
-from miles.utils.audit_utils.witness.cpu import CpuWitness, TrainingSampleIdentity
+from miles.backends.training_utils.model_companion import ModelCompanion, TrainingSampleIdentity
 from miles.utils.ft_utils.process_group_utils import GroupInfo
 
 _CKPT_TRANSFER_LOGGER = "miles.backends.megatron_utils.ft.checkpoint_transfer"
+
+
+@pytest.fixture()
+def single_rank_gloo(tmp_path: Path) -> Iterator[dist.ProcessGroup]:
+    """Provide the real single-rank process group required by integrity validation."""
+    rendezvous = tmp_path / "gloo-rendezvous"
+    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1)
+    try:
+        yield dist.group.WORLD
+    finally:
+        dist.destroy_process_group()
 
 
 class _FakeTransport:
@@ -54,7 +68,10 @@ def state_dict() -> MCoreTensorAwareStateDict:
             "step": ShardedTensor.from_rank_offsets("step", torch.tensor([100], dtype=torch.int64)),
         },
     }
-    common = {"iteration": 0, "args_repr": "dummy"}
+    common = {
+        "iteration": 0,
+        "args_repr": "dummy",
+    }
     return MCoreTensorAwareStateDict(common=common, sharded_state_dict=sharded_state_dict)
 
 
@@ -105,19 +122,39 @@ class TestSerializeForTransport:
 
 
 class TestDeserializeFromTransport:
-    def test_round_trip_preserves_the_real_cpu_witness_sharded_object(self) -> None:
-        """FT transport preserves the witness shard data and its intra-DP replica identity."""
-        witness = CpuWitness(pipeline_rank=2, chunk_index=1, replica_id=(3, 4, 0))
+    def test_round_trip_preserves_the_real_model_companion_buffers(self, single_rank_gloo: dist.ProcessGroup) -> None:
+        """A surviving cell donor restores both witness outcomes into a healing receiver."""
+        donor = ModelCompanion(pipeline_rank=0, chunk_index=0, replica_id=(0, 0, 0))
         sample = TrainingSampleIdentity(source_sample_index=7, row_index=0, row_count=1)
-        witness.record([sample])
-        sharded_state_dict = {"model": witness.sharded_state_dict(prefix="actor.cpu_witness.")}
-        state_dict = MCoreTensorAwareStateDict(common={}, sharded_state_dict=sharded_state_dict)
+        skipped_sample = TrainingSampleIdentity(source_sample_index=8, row_index=0, row_count=1)
+        donor.record([sample])
+        donor.record_skipped_nonfinite([skipped_sample])
+        state_dict, _ = MCoreTensorAwareStateDict.from_state_dict(
+            {"model": donor.sharded_state_dict(prefix="model_companion.")},
+            algo="atomic",
+            parallelization_group=single_rank_gloo,
+        )
+
+        donor.record([sample])
+        donor.record_skipped_nonfinite([skipped_sample])
 
         _, restored = _TransportCodec.decode(_TransportCodec.encode(state_dict=state_dict, iteration=11))
 
-        [restored_object] = list(restored.sharded_state_dict["model"].values())
-        assert restored_object.replica_id == (3, 4, 0)
-        assert restored_object.data == {"version": 1, "sample_counts": {sample: 1}}
+        receiver = ModelCompanion(pipeline_rank=0, chunk_index=0, replica_id=(0, 0, 0))
+        receiver_state = restored.to_state_dict(
+            {"model": receiver.sharded_state_dict(prefix="model_companion.")},
+            algo="atomic",
+            parallelization_group=single_rank_gloo,
+        )
+        receiver.load_state_dict(
+            {
+                "trained_rows": receiver_state["model"]["model_companion.trained_rows"],
+                "skipped_nonfinite_rows": receiver_state["model"]["model_companion.skipped_nonfinite_rows"],
+            }
+        )
+
+        assert receiver.snapshot() == {sample: 1}
+        assert receiver.snapshot_skipped_nonfinite() == {skipped_sample: 1}
 
     def test_round_trip_preserves_tensor_values_iteration_and_common(self, state_dict: MCoreTensorAwareStateDict):
         original_tensors = [t.clone() for t in state_dict.tensors]
