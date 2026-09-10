@@ -73,6 +73,9 @@ class CustomDataSource:
     def load(self, rollout_id=None) -> None: ...
 ```
 
+The built-in source checkpoints sample identity cursors even when the global
+dataset is disabled.
+
 ### `--custom-generate-function-path`
 
 Replace the inner microgroup generator inside

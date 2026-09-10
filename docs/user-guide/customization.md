@@ -107,6 +107,8 @@ class CustomDataSource(DataSource):
 
 **Default:** `miles.rollout.data_source.RolloutDataSource`.
 
+- The built-in source checkpoints sample identity cursors even when the global dataset is disabled.
+
 ### `--eval-function-path`
 
 Same signature as `--rollout-function-path`. Defaults to whatever rollout function is
