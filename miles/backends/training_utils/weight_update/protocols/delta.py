@@ -25,6 +25,7 @@ from miles.backends.training_utils.weight_update.utils import get_data_replica_r
 from miles.utils import async_utils
 from miles.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.timer import timer
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,8 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
 
     def finalize(self, weight_version: int) -> None:
         """Write this version as a canonical HF dir, have the engines pull and reload it."""
-        self._write_delta_files(weight_version)
+        with timer("disk_delta_write"):
+            self._write_delta_files(weight_version)
         self._reload_engines(weight_version)
         self._record_metrics(weight_version)
 
@@ -382,40 +384,44 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
             self._post_write_hook(self.args, self._version_dir, list(self.rollout_engines))
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
-            pulls = async_utils.wait_futures(
-                [
-                    async_utils.submit(
-                        client.pull_weights(
-                            target_version=weight_version,
-                            local_checkpoint_dir=self.args.update_weight_local_checkpoint_dir,
-                            source_dir=self.args.update_weight_disk_dir,
+            with timer("disk_delta_pull"):
+                pulls = async_utils.wait_futures(
+                    [
+                        async_utils.submit(
+                            client.pull_weights(
+                                target_version=weight_version,
+                                local_checkpoint_dir=self.args.update_weight_local_checkpoint_dir,
+                                source_dir=self.args.update_weight_disk_dir,
+                            )
                         )
-                    )
-                    for client in self.rollout_engines
-                ]
-            )
+                        for client in self.rollout_engines
+                    ]
+                )
             check_weight_sync_results(pulls, is_lora=False)
             mode = self.args.pause_generation_mode
-            async_utils.wait_futures(
-                [async_utils.submit(client.pause_generation(mode=mode)) for client in self.rollout_engines]
-            )
-            if mode != "in_place":
-                async_utils.wait_futures([async_utils.submit(client.flush_cache()) for client in self.rollout_engines])
-            results = async_utils.wait_futures(
-                [
-                    async_utils.submit(
-                        client.update_weights_from_disk(
-                            model_path=self.args.update_weight_local_checkpoint_dir,
-                            weight_version=str(weight_version),
-                        )
+            with timer("disk_delta_pause"):
+                async_utils.wait_futures(
+                    [async_utils.submit(client.pause_generation(mode=mode)) for client in self.rollout_engines]
+                )
+                if mode != "in_place":
+                    async_utils.wait_futures(
+                        [async_utils.submit(client.flush_cache()) for client in self.rollout_engines]
                     )
-                    for client in self.rollout_engines
-                ]
-            )
-            check_weight_sync_results(results, is_lora=False)
-            async_utils.wait_futures(
-                [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
-            )
+                results = async_utils.wait_futures(
+                    [
+                        async_utils.submit(
+                            client.update_weights_from_disk(
+                                model_path=self.args.update_weight_local_checkpoint_dir,
+                                weight_version=str(weight_version),
+                            )
+                        )
+                        for client in self.rollout_engines
+                    ]
+                )
+                check_weight_sync_results(results, is_lora=False)
+                async_utils.wait_futures(
+                    [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
+                )
         dist.barrier(group=get_gloo_group())
 
     def _record_metrics(self, weight_version: int) -> None:
